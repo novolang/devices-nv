@@ -1,0 +1,348 @@
+// rtc_tests — the real-time-clock trait implemented by a driver over
+// the I2C double and by a fixed clock that performs nothing; BCD, the
+// 12-hour form, the calendar and the weekday.
+
+use std.test
+use embedded_hal.{ I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring }
+use dev_rtc.{ RtcDateTime, RealTimeClock, RealTimeClockAsync }
+
+// ── Doubles ──────────────────────────────────────────────────────────
+//
+// A trait method's receiver is a plain `self`, so a double cannot
+// record its calls.  Each double answers from fixed data instead: the
+// I2C double acknowledges one write frame, and the SPI and GPIO doubles
+// panic on the one call a test names (`trip`), which
+// `test.assert_raises` observes.
+
+// An I2C bus with one device at `addr`.  Register r reads `regs[r]`, and
+// a multi-byte read continues through the following registers.  A write
+// is acknowledged when it reaches `addr` and its bytes are `expect`.
+struct FakeI2c
+    addr: Int
+    regs: [Int]
+    expect: [Int]
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr or data.len() != self.expect.len()
+            return false
+        for i in 0..data.len()
+            if (data[i] as Int) != self.expect[i]
+                return false
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[i] as u8)
+        Some(out)
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        let r = tx[0] as Int
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[r + i] as u8)
+        Some(out)
+
+// An SPI bus whose reads answer `rx`, from its first byte.  A write
+// whose first byte is `trip` panics.
+struct FakeSpi
+    rx: [Int]
+    trip: Int
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        pass
+
+    fn transfer(self, b: Int) -> Int [hw]
+        self.rx[0]
+
+    fn write(self, data: [u8]) [hw]
+        if data.len() > 0 and (data[0] as Int) == self.trip
+            panic.panic("spi write")
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.rx[i] as u8)
+        out
+
+// A GPIO port.  A write of `val` to `pin` panics when pin * 10 + val
+// equals `trip`.
+struct FakePins
+    trip: Int
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        pass
+
+    fn set(self, pin: Int, val: Int) [hw]
+        if pin * 10 + val == self.trip
+            panic.panic("gpio set")
+
+    fn get(self, pin: Int) -> Int [hw]
+        0
+
+// ── A driver over I2C ────────────────────────────────────────────────
+//
+// A clock laid out as Analog Devices' DS3231 is: seven BCD registers
+// from 0x00, the seconds, minutes, hours, weekday, date, month and
+// year.  Bit 6 of the hours selects the 12-hour form, with bit 5 the PM
+// bit; bit 7 of the month is the century.  Bit 7 of STATUS (0x0f) is
+// the oscillator-stop flag.  Alarm 1 is four registers from 0x07, and
+// writing 0 to CONTROL (0x0e) disarms it.
+
+struct Ds
+    bus: FakeI2c
+    w: DeviceWiring
+
+fn hour_of(b: Int) -> Int
+    if (b & 0x40) != 0
+        return dev_rtc.rtc_hour_24(dev_rtc.rtc_from_bcd(b & 0x1f), (b & 0x20) != 0)
+    dev_rtc.rtc_from_bcd(b & 0x3f)
+
+impl RealTimeClock[hw] for Ds
+    fn rtc_now(self) -> ?RtcDateTime [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x00, 7)
+            Some(b) =>
+                let century = if (b[5] as Int & 0x80) != 0
+                    100
+                else
+                    0
+                Some(RtcDateTime { year: 2000 + century + dev_rtc.rtc_from_bcd(b[6] as Int),
+                                   month: dev_rtc.rtc_from_bcd(b[5] as Int & 0x1f),
+                                   day: dev_rtc.rtc_from_bcd(b[4] as Int),
+                                   hour: hour_of(b[2] as Int),
+                                   minute: dev_rtc.rtc_from_bcd(b[1] as Int),
+                                   second: dev_rtc.rtc_from_bcd(b[0] as Int) })
+            None    => None
+
+    fn rtc_set(self, t: RtcDateTime) -> Bool [hw]
+        if not dev_rtc.rtc_is_valid(t) or t.year < 2000 or t.year > 2199
+            return false
+        let century = if t.year >= 2100
+            0x80
+        else
+            0
+        dev_bus.wiring_write(self.bus, self.w, 0x00,
+                             [dev_rtc.rtc_to_bcd(t.second) as u8, dev_rtc.rtc_to_bcd(t.minute) as u8,
+                              dev_rtc.rtc_to_bcd(t.hour) as u8, dev_rtc.rtc_weekday(t) as u8,
+                              dev_rtc.rtc_to_bcd(t.day) as u8, (dev_rtc.rtc_to_bcd(t.month) | century) as u8,
+                              dev_rtc.rtc_to_bcd(t.year % 100) as u8])
+
+    fn rtc_running(self) -> Bool [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x0f, 1)
+            Some(b) => (b[0] as Int & 0x80) == 0
+            None    => false
+
+    fn rtc_set_alarm(self, t: RtcDateTime) -> Bool [hw]
+        if not dev_rtc.rtc_is_valid(t)
+            return false
+        dev_bus.wiring_write(self.bus, self.w, 0x07,
+                             [dev_rtc.rtc_to_bcd(t.second) as u8, dev_rtc.rtc_to_bcd(t.minute) as u8,
+                              dev_rtc.rtc_to_bcd(t.hour) as u8, dev_rtc.rtc_to_bcd(t.day) as u8])
+
+    fn rtc_cancel_alarm(self) -> Bool [hw]
+        dev_bus.wiring_write(self.bus, self.w, 0x0e, [0 as u8])
+
+impl RealTimeClockAsync[hw] for Ds
+    async fn rtc_alarm_wait(self) -> ?RtcDateTime [hw]
+        // The double's alarm has always fired; a part on a scheduler
+        // parks here until its interrupt line goes low.
+        self.rtc_now_valid()
+
+// 2026-10-06 14:30:59, a Tuesday, in the 24-hour form, with the
+// oscillator running unless `stopped`.
+fn regs(stopped: Bool) -> [Int]
+    var r = list.zeros(16)
+    r[0x00] = 0x59
+    r[0x01] = 0x30
+    r[0x02] = 0x14
+    r[0x03] = 2
+    r[0x04] = 0x06
+    r[0x05] = 0x10
+    r[0x06] = 0x26
+    r[0x0f] = if stopped
+        0x80
+    else
+        0x00
+    r
+
+fn clock(r: [Int], expect: [Int]) -> Ds
+    Ds { bus: FakeI2c { addr: 0x68, regs: r, expect: expect }, w: dev_bus.wiring_i2c(0, 0x68) }
+
+fn when(y: Int, mo: Int, d: Int, h: Int, mi: Int, s: Int) -> RtcDateTime
+    RtcDateTime { year: y, month: mo, day: d, hour: h, minute: mi, second: s }
+
+@test
+fn test_now_decodes_the_bcd_registers() [io, hw]
+    match clock(regs(false), []).rtc_now()
+        Some(t) =>
+            test.assert(t.year == 2026)
+            test.assert(t.month == 10)
+            test.assert(t.day == 6)
+            test.assert(t.hour == 14)
+            test.assert(t.minute == 30)
+            test.assert(t.second == 59)
+        None    => test.assert(false)
+
+@test
+fn test_the_12_hour_form_and_the_century_are_read() [io, hw]
+    var r = regs(false)
+    // 2:30 PM in the 12-hour form, in the next century.
+    r[0x02] = 0x40 | 0x20 | 0x02
+    r[0x05] = 0x80 | 0x10
+    match clock(r, []).rtc_now()
+        Some(t) =>
+            test.assert(t.hour == 14)
+            test.assert(t.year == 2126)
+        None    => test.assert(false)
+
+@test
+fn test_set_writes_seven_bcd_registers_with_the_weekday() [io, hw]
+    let t = when(2026, 10, 6, 14, 30, 59)
+    test.assert(clock(regs(false), [0x00, 0x59, 0x30, 0x14, 2, 0x06, 0x10, 0x26]).rtc_set(t))
+    // The next century sets the century bit, and 2126-10-06 is a Sunday.
+    let later = when(2126, 10, 6, 14, 30, 59)
+    test.assert(clock(regs(false), [0x00, 0x59, 0x30, 0x14, 7, 0x06, 0x90, 0x26]).rtc_set(later))
+
+@test
+fn test_set_refuses_a_time_the_calendar_or_the_part_does_not_have() [io, hw]
+    let c = clock(regs(false), [])
+    test.assert(not c.rtc_set(when(2025, 2, 29, 0, 0, 0)))
+    test.assert(not c.rtc_set(when(1999, 1, 1, 0, 0, 0)))
+    test.assert(not c.rtc_set(when(2200, 1, 1, 0, 0, 0)))
+
+@test
+fn test_a_stopped_oscillator_makes_the_time_invalid() [io, hw]
+    test.assert(clock(regs(false), []).rtc_running())
+    test.assert(clock(regs(false), []).rtc_now_valid() != None)
+    let stopped = clock(regs(true), [])
+    test.assert(not stopped.rtc_running())
+    test.assert(stopped.rtc_now_valid() == None)
+    // The registers still hold a time; it is the time that is wrong.
+    test.assert(stopped.rtc_now() != None)
+
+@test
+fn test_an_absent_clock_answers_nothing() [io, hw]
+    let gone = Ds { bus: FakeI2c { addr: 0x69, regs: regs(false), expect: [] },
+        w: dev_bus.wiring_i2c(0, 0x68) }
+    test.assert(gone.rtc_now() == None)
+    test.assert(not gone.rtc_running())
+
+@test
+fn test_the_alarm_is_armed_and_disarmed() [io, hw]
+    let t = when(2026, 10, 7, 7, 0, 0)
+    test.assert(clock(regs(false), [0x07, 0x00, 0x00, 0x07, 0x07]).rtc_set_alarm(t))
+    test.assert(not clock(regs(false), [0x07, 0x00, 0x00, 0x07, 0x07]).rtc_set_alarm(when(2026, 13, 1, 0, 0, 0)))
+    test.assert(clock(regs(false), [0x0e, 0x00]).rtc_cancel_alarm())
+
+@test
+fn test_the_async_form_answers_when_the_alarm_fires() [io, hw, async]
+    match await clock(regs(false), []).rtc_alarm_wait()
+        Some(t) => test.assert(t.minute == 30)
+        None    => test.assert(false)
+    test.assert(await clock(regs(true), []).rtc_alarm_wait() == None)
+
+// ── A fixed clock ────────────────────────────────────────────────────
+
+// Noon on New Year's Day 2030, always, performing nothing.
+struct Fixed
+    hour: Int
+
+impl RealTimeClock[] for Fixed
+    fn rtc_now(self) -> ?RtcDateTime
+        Some(when(2030, 1, 1, self.hour, 0, 0))
+
+    fn rtc_set(self, t: RtcDateTime) -> Bool
+        false
+
+    fn rtc_running(self) -> Bool
+        true
+
+    fn rtc_set_alarm(self, t: RtcDateTime) -> Bool
+        false
+
+    fn rtc_cancel_alarm(self) -> Bool
+        false
+
+fn is_noon<C: RealTimeClock[e]>(c: C) -> Bool [e]
+    match c.rtc_now_valid()
+        Some(t) => t.hour == 12 and t.minute == 0
+        None    => false
+
+@test
+fn test_a_fixed_clock_needs_no_hardware()
+    test.assert(is_noon(Fixed { hour: 12 }))
+    test.assert(not Fixed { hour: 12 }.rtc_set(when(2030, 1, 1, 0, 0, 0)))
+    test.assert(not Fixed { hour: 12 }.rtc_set_alarm(when(2030, 1, 1, 0, 0, 0)))
+    test.assert(not Fixed { hour: 12 }.rtc_cancel_alarm())
+
+// ── BCD, the 12-hour form, the calendar and the weekday ──────────────
+
+@test
+fn test_bcd_both_ways() [io]
+    test.assert(dev_rtc.rtc_from_bcd(0x59) == 59)
+    test.assert(dev_rtc.rtc_from_bcd(0x00) == 0)
+    test.assert(dev_rtc.rtc_to_bcd(59) == 0x59)
+    test.assert(dev_rtc.rtc_to_bcd(7) == 0x07)
+    test.assert(dev_rtc.rtc_from_bcd(dev_rtc.rtc_to_bcd(42)) == 42)
+
+@test
+fn test_the_12_hour_form() [io]
+    test.assert(dev_rtc.rtc_hour_24(12, false) == 0)
+    test.assert(dev_rtc.rtc_hour_24(1, false) == 1)
+    test.assert(dev_rtc.rtc_hour_24(11, false) == 11)
+    test.assert(dev_rtc.rtc_hour_24(12, true) == 12)
+    test.assert(dev_rtc.rtc_hour_24(1, true) == 13)
+    test.assert(dev_rtc.rtc_hour_24(11, true) == 23)
+
+@test
+fn test_leap_years() [io]
+    test.assert(dev_rtc.rtc_is_leap_year(2024))
+    test.assert(not dev_rtc.rtc_is_leap_year(2026))
+    test.assert(not dev_rtc.rtc_is_leap_year(2100))
+    test.assert(dev_rtc.rtc_is_leap_year(2000))
+
+@test
+fn test_days_in_each_month() [io]
+    var total = 0
+    for m in 1..13
+        total = total + dev_rtc.rtc_days_in_month(2026, m)
+    test.assert(total == 365)
+    test.assert(dev_rtc.rtc_days_in_month(2024, 2) == 29)
+    test.assert(dev_rtc.rtc_days_in_month(2026, 2) == 28)
+    test.assert(dev_rtc.rtc_days_in_month(2026, 0) == 0)
+    test.assert(dev_rtc.rtc_days_in_month(2026, 13) == 0)
+
+@test
+fn test_validity_of_each_field() [io]
+    test.assert(dev_rtc.rtc_is_valid(when(2024, 2, 29, 23, 59, 59)))
+    test.assert(not dev_rtc.rtc_is_valid(when(2026, 2, 29, 0, 0, 0)))
+    test.assert(not dev_rtc.rtc_is_valid(when(2026, 0, 1, 0, 0, 0)))
+    test.assert(not dev_rtc.rtc_is_valid(when(2026, 1, 0, 0, 0, 0)))
+    test.assert(not dev_rtc.rtc_is_valid(when(2026, 1, 1, 24, 0, 0)))
+    test.assert(not dev_rtc.rtc_is_valid(when(2026, 1, 1, 0, 60, 0)))
+    test.assert(not dev_rtc.rtc_is_valid(when(2026, 1, 1, 0, 0, 60)))
+    test.assert(not dev_rtc.rtc_is_valid(when(2026, 1, 1, -1, 0, 0)))
+
+@test
+fn test_the_weekday_of_known_dates() [io]
+    // 2026-10-06 is a Tuesday, 2000-01-01 a Saturday, 2024-02-29 a
+    // Thursday and 2023-01-01 a Sunday.
+    test.assert(dev_rtc.rtc_weekday(when(2026, 10, 6, 0, 0, 0)) == 2)
+    test.assert(dev_rtc.rtc_weekday(when(2000, 1, 1, 0, 0, 0)) == 6)
+    test.assert(dev_rtc.rtc_weekday(when(2024, 2, 29, 0, 0, 0)) == 4)
+    test.assert(dev_rtc.rtc_weekday(when(2023, 1, 1, 0, 0, 0)) == 7)
+    // One date in every month of a year, so each month's term is used.
+    let expected = [4, 7, 7, 3, 5, 1, 3, 6, 2, 4, 7, 2]
+    for m in 1..13
+        test.assert(dev_rtc.rtc_weekday(when(2026, m, 1, 0, 0, 0)) == expected[m - 1])

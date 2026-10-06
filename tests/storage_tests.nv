@@ -1,0 +1,215 @@
+// storage_tests — block storage is embedded-hal-nv's `BlockDevice`, and a
+// flash driver implements it over the SPI double and a chip-select pin
+// through `dev_bus.wiring_spi_exchange`, as the other device kinds are
+// implemented over their buses.
+
+use std.test
+use embedded_hal.{ I2cBus, SpiBus, GpioOut, BlockDevice }
+use dev_bus.{ DeviceWiring }
+
+// ── Doubles ──────────────────────────────────────────────────────────
+//
+// A trait method's receiver is a plain `self`, so a double cannot
+// record its calls.  Each double answers from fixed data instead: the
+// I2C double acknowledges one write frame, and the SPI and GPIO doubles
+// panic on the one call a test names (`trip`), which
+// `test.assert_raises` observes.
+
+// An I2C bus with one device at `addr`.  Register r reads `regs[r]`, and
+// a multi-byte read continues through the following registers.  A write
+// is acknowledged when it reaches `addr` and its bytes are `expect`.
+struct FakeI2c
+    addr: Int
+    regs: [Int]
+    expect: [Int]
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr or data.len() != self.expect.len()
+            return false
+        for i in 0..data.len()
+            if (data[i] as Int) != self.expect[i]
+                return false
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[i] as u8)
+        Some(out)
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        let r = tx[0] as Int
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[r + i] as u8)
+        Some(out)
+
+// An SPI bus whose reads answer `rx`, from its first byte.  A write
+// whose first byte is `trip` panics.
+struct FakeSpi
+    rx: [Int]
+    trip: Int
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        pass
+
+    fn transfer(self, b: Int) -> Int [hw]
+        self.rx[0]
+
+    fn write(self, data: [u8]) [hw]
+        if data.len() > 0 and (data[0] as Int) == self.trip
+            panic.panic("spi write")
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.rx[i] as u8)
+        out
+
+// A GPIO port.  A write of `val` to `pin` panics when pin * 10 + val
+// equals `trip`.
+struct FakePins
+    trip: Int
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        pass
+
+    fn set(self, pin: Int, val: Int) [hw]
+        if pin * 10 + val == self.trip
+            panic.panic("gpio set")
+
+    fn get(self, pin: Int) -> Int [hw]
+        0
+
+// ── A flash driver over SPI ──────────────────────────────────────────
+//
+// A serial flash laid out as Adesto's AT45DB DataFlash is in its
+// binary page mode: 512-byte pages, so a block is a page.  A read is
+// opcode 0x03 and a three-byte address; opcode 0x82 erases a page and
+// programs it from the bytes that follow; opcode 0x81 erases a page.
+// The address of page p is p * 512.
+
+struct Flash
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+    pages: Int
+
+fn command(op: Int, page: Int) -> [u8]
+    let a = page * 512
+    [op as u8, ((a >> 16) & 0xff) as u8, ((a >> 8) & 0xff) as u8, (a & 0xff) as u8]
+
+impl BlockDevice for Flash
+    fn block_size(self) -> Int [hw]
+        512
+
+    fn block_count(self) -> Int [hw]
+        self.pages
+
+    fn read_block(self, block: Int, var dst: Vec[u8; 512]) -> Bool [hw]
+        dst.clear()
+        if block < 0 or block >= self.pages
+            return false
+        let rx = dev_bus.wiring_spi_exchange(self.bus, self.pins, self.w, command(0x03, block), 512)
+        if rx.len() != 512
+            return false
+        for b in rx
+            let _ = dst.push(b)
+        true
+
+    fn write_block(self, block: Int, var src: Vec[u8; 512]) -> Bool [hw]
+        if block < 0 or block >= self.pages or src.len() != 512
+            return false
+        var frame = command(0x82, block)
+        for i in 0..512
+            list.push(frame, src[i])
+        let _ = dev_bus.wiring_spi_exchange(self.bus, self.pins, self.w, frame, 0)
+        true
+
+    fn erase_block(self, block: Int) -> Bool [hw]
+        if block < 0 or block >= self.pages
+            return false
+        let _ = dev_bus.wiring_spi_exchange(self.bus, self.pins, self.w, command(0x81, block), 0)
+        true
+
+// A page whose byte i reads i % 251, and a chip of eight pages on chip
+// select 9.  The SPI double panics on a command of `trip`.
+fn flash(trip: Int) -> Flash
+    var rx = list.zeros(512)
+    for i in 0..512
+        rx[i] = i % 251
+    Flash { bus: FakeSpi { rx: rx, trip: trip },
+        pins: FakePins { trip: -1 },
+        w: dev_bus.wiring_spi(0, 9),
+        pages: 8 }
+
+// The total of a device's blocks, generic over the device: the shape a
+// filesystem is written in.
+fn capacity<D: BlockDevice>(d: D) -> Int [hw]
+    d.block_size() * d.block_count()
+
+@test
+fn test_the_geometry_is_the_page() [io, hw]
+    test.assert(capacity(flash(-1)) == 4096)
+
+@test
+fn test_read_block_fills_the_caller_s_buffer_from_one_transaction() [io, hw]
+    var buf: Vec[u8; 512] = Vec.new()
+    test.assert(flash(-1).read_block(3, buf))
+    test.assert(buf.len() == 512)
+    test.assert((buf[0] as Int) == 0)
+    test.assert((buf[300] as Int) == 49)
+    // The read is opcode 0x03.
+    test.assert_raises(() => read_one(0x03))
+
+fn read_one(trip: Int) [hw]
+    var buf: Vec[u8; 512] = Vec.new()
+    let _ = flash(trip).read_block(0, buf)
+
+@test
+fn test_a_block_past_the_end_is_refused() [io, hw]
+    var buf: Vec[u8; 512] = Vec.new()
+    let f = flash(-1)
+    test.assert(not f.read_block(8, buf))
+    test.assert(buf.len() == 0)
+    test.assert(not f.read_block(-1, buf))
+    test.assert(not f.write_block(8, buf))
+    test.assert(not f.erase_block(8))
+
+@test
+fn test_a_flash_wired_without_a_chip_select_reads_nothing() [io, hw]
+    var buf: Vec[u8; 512] = Vec.new()
+    let f = Flash { bus: FakeSpi { rx: [0], trip: -1 }, pins: FakePins { trip: -1 },
+                    w: dev_bus.wiring_i2c(0, 0x50), pages: 8 }
+    test.assert(not f.read_block(0, buf))
+
+@test
+fn test_write_and_erase_send_their_opcodes() [io, hw]
+    var buf: Vec[u8; 512] = Vec.new()
+    test.assert(flash(-1).read_block(1, buf))
+    test.assert(flash(-1).write_block(1, buf))
+    test.assert(flash(-1).erase_block(1))
+    test.assert_raises(() => write_one(0x82))
+    test.assert_raises(() => erase_one(0x81))
+    // A buffer that is not a whole page is not written.
+    var short: Vec[u8; 512] = Vec.new()
+    test.assert(not flash(-1).write_block(1, short))
+
+fn write_one(trip: Int) [hw]
+    var buf: Vec[u8; 512] = Vec.new()
+    let f = flash(trip)
+    let _ = f.read_block(0, buf)
+    let _ = f.write_block(0, buf)
+
+fn erase_one(trip: Int) [hw]
+    let _ = flash(trip).erase_block(2)

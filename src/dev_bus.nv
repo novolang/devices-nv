@@ -1,0 +1,163 @@
+// dev_bus — where a device sits on a board, the register access a
+// driver performs through the board's bus, and the wait for a device's
+// interrupt line.
+//
+// A device is wired to the board in one of two ways.  On an I2C bus it
+// answers at a seven-bit address.  On an SPI bus it is selected by a
+// chip-select pin that the controller drives low for the length of a
+// transaction.  Either way it may also drive an interrupt line, a GPIO
+// pin it pulses or holds when it has something to report: a new
+// sample, a finished conversion, an alarm.  `DeviceWiring` records the
+// three facts, with -1 for the ones a device does not use, and is what
+// a driver is constructed from.
+//
+// The functions over a bus take the bus as a type parameter bounded by
+// embedded-hal-nv's `I2cBus` or `SpiBus`, so a driver written over them
+// builds against the board's bus, a test double, or any other
+// implementation of the trait.
+
+use core.rt
+use embedded_hal.{ I2cBus, SpiBus, GpioOut }
+
+// Where a device sits on the board.
+//
+// `bus` is the instance of the bus, 0 for the first.  `addr` is the
+// seven-bit I2C address, or -1 on SPI.  `cs` is the chip-select pin on
+// SPI, or -1 on I2C.  `irq` is the pin the device's interrupt line
+// reaches, or -1 when it has none or the board does not wire it.  A pin
+// is the hardware's own number, as `embedded_hal.GpioOut` takes it.
+pub @value
+struct DeviceWiring
+    bus: Int
+    addr: Int
+    cs: Int
+    irq: Int
+
+// A device on I2C bus `bus` at the seven-bit address `addr`, with no
+// interrupt line.
+//
+// ```novo
+// let w = dev_bus.wiring_i2c(0, 0x18)
+// println("${w.addr}")        // 24
+// ```
+pub fn wiring_i2c(bus: Int, addr: Int) -> DeviceWiring
+    DeviceWiring { bus: bus, addr: addr, cs: -1, irq: -1 }
+
+// A device on SPI bus `bus` selected by the pin `cs`, with no interrupt
+// line.
+pub fn wiring_spi(bus: Int, cs: Int) -> DeviceWiring
+    DeviceWiring { bus: bus, addr: -1, cs: cs, irq: -1 }
+
+// The same wiring with the device's interrupt line on pin `irq`.
+//
+// ```novo
+// let w = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x18), 25)
+// println("${dev_bus.wiring_has_irq(w)}")   // true
+// ```
+pub fn wiring_irq(w: DeviceWiring, irq: Int) -> DeviceWiring
+    DeviceWiring { bus: w.bus, addr: w.addr, cs: w.cs, irq: irq }
+
+// Whether the device is selected by a chip-select pin, which is to say
+// it sits on SPI.
+pub fn wiring_is_spi(w: DeviceWiring) -> Bool
+    w.cs >= 0
+
+// Whether the board wires the device's interrupt line to a pin.
+pub fn wiring_has_irq(w: DeviceWiring) -> Bool
+    w.irq >= 0
+
+// Reads `n` bytes from the register `reg` of an I2C device, in one
+// transaction: the register address is written, then a repeated start
+// reads the bytes back.  Two transactions with a stop between them
+// would let another controller on the bus move the register pointer
+// before the read.
+//
+// Answers `None` when the device did not acknowledge, and for a wiring
+// that is not on I2C.
+pub fn wiring_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int) -> ?[u8] [hw]
+    if w.addr < 0
+        return None
+    bus.write_read(w.addr, [reg as u8], n)
+
+// Writes `data` to the register `reg` of an I2C device: the register
+// address, then the bytes, in one transaction.  A device that
+// auto-increments its register pointer stores the bytes in consecutive
+// registers.
+//
+// Answers whether the device acknowledged every byte, and `false` for a
+// wiring that is not on I2C.
+pub fn wiring_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, data: [u8]) -> Bool [hw]
+    if w.addr < 0
+        return false
+    var frame: [u8] = [reg as u8]
+    for b in data
+        list.push(frame, b)
+    bus.write(w.addr, frame)
+
+// Runs one SPI transaction with an SPI device: drives its chip-select
+// pin low, writes `tx`, reads `n` bytes, and drives the pin high again.
+// Answers the bytes read, which are empty when `n` is 0.
+//
+// The first bytes of `tx` are the device's command, whose shape is the
+// device's own: many sensors set the top bit of a register address to
+// read it and the next bit to auto-increment.  A wiring with no
+// chip-select pin answers the empty list and drives no pin.
+pub fn wiring_spi_exchange<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, tx: [u8],
+                                                  n: Int) -> [u8] [hw]
+    if w.cs < 0
+        return []
+    gpio.set(w.cs, 0)
+    bus.write(tx)
+    let rx = if n > 0
+        bus.read(n)
+    else
+        []
+    gpio.set(w.cs, 1)
+    rx
+
+// The signed value of the low `bits` bits of `raw`, read as two's
+// complement.  A sensor reports a signed reading in a register narrower
+// than an `Int`, so a reading of -1 in a 12-bit register arrives as
+// 4095.
+//
+// ```novo
+// println("${dev_bus.dev_sign_extend(0xfff, 12)}")   // -1
+// println("${dev_bus.dev_sign_extend(0x7ff, 12)}")   // 2047
+// ```
+pub fn dev_sign_extend(raw: Int, bits: Int) -> Int
+    let mask = (1 << bits) - 1
+    let v = raw & mask
+    if v >= (1 << (bits - 1))
+        return v - (1 << bits)
+    v
+
+// A device's interrupt line, awaited on a microcontroller.
+//
+// The form a program at `@tier(embedded)` waits in, where an `async fn`
+// is refused: `ready_arm` arms the wait on the caller's Future and
+// answers at once, 0 when armed and a negative value when refused.  The
+// device's interrupt resolves the Future, with 0 for an event and a
+// negative value for a fault, and the caller awaits it with
+// `core.rt.future_await` in a function that declares `[async]`.  The
+// caller then reads the device through its sync trait:
+//
+//     @tier(embedded)
+//     fn next_sample(a: Lis3dh, f: Future) -> ?AccelMilliG [hw, async]
+//         core.rt.future_reset(f)
+//         if a.ready_arm(f) < 0
+//             return None
+//         if core.rt.future_await(f) < 0
+//             return None
+//         a.accel_read()
+//
+// The contract is embedded-hal-nv's awaitable one.  An arm allocates
+// nothing.  A device holds one armed wait, and a second arm is refused.
+// `ready_disarm` answers `true` when the wait was still armed and the
+// device has let go of the Future, and `false` when nothing was armed or
+// the event already resolved it.  `ready_irqs` counts the interrupts the
+// line has taken; a device that answers before the arm returns reports
+// 0.
+pub trait AsyncDeviceReady[e]
+    fn ready_arm(self, f: Future) -> Int [e]
+    fn ready_disarm(self) -> Bool [e]
+    fn ready_irqs(self) -> Int [e]

@@ -1,0 +1,211 @@
+// thermo_tests — the thermometer trait implemented by a one-shot driver
+// over the I2C double and by a recorded reading; the early-read refusal
+// and the count conversion.
+
+use std.test
+use embedded_hal.{ I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring }
+use dev_thermo.{ TempMilliC, Thermometer, ThermometerAsync }
+
+// ── Doubles ──────────────────────────────────────────────────────────
+//
+// A trait method's receiver is a plain `self`, so a double cannot
+// record its calls.  Each double answers from fixed data instead: the
+// I2C double acknowledges one write frame, and the SPI and GPIO doubles
+// panic on the one call a test names (`trip`), which
+// `test.assert_raises` observes.
+
+// An I2C bus with one device at `addr`.  Register r reads `regs[r]`, and
+// a multi-byte read continues through the following registers.  A write
+// is acknowledged when it reaches `addr` and its bytes are `expect`.
+struct FakeI2c
+    addr: Int
+    regs: [Int]
+    expect: [Int]
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr or data.len() != self.expect.len()
+            return false
+        for i in 0..data.len()
+            if (data[i] as Int) != self.expect[i]
+                return false
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[i] as u8)
+        Some(out)
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        let r = tx[0] as Int
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[r + i] as u8)
+        Some(out)
+
+// An SPI bus whose reads answer `rx`, from its first byte.  A write
+// whose first byte is `trip` panics.
+struct FakeSpi
+    rx: [Int]
+    trip: Int
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        pass
+
+    fn transfer(self, b: Int) -> Int [hw]
+        self.rx[0]
+
+    fn write(self, data: [u8]) [hw]
+        if data.len() > 0 and (data[0] as Int) == self.trip
+            panic.panic("spi write")
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.rx[i] as u8)
+        out
+
+// A GPIO port.  A write of `val` to `pin` panics when pin * 10 + val
+// equals `trip`.
+struct FakePins
+    trip: Int
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        pass
+
+    fn set(self, pin: Int, val: Int) [hw]
+        if pin * 10 + val == self.trip
+            panic.panic("gpio set")
+
+    fn get(self, pin: Int) -> Int [hw]
+        0
+
+// ── A one-shot driver over I2C ───────────────────────────────────────
+//
+// A part laid out as TI's TMP102 is: the result is two bytes from
+// register 0x00, big-endian and left-justified to 12 bits at 1/16 °C
+// per step; writing 0x81 to the high byte of the configuration register
+// (0x01) starts one conversion from shutdown, which takes at most
+// 35 ms.
+
+struct OneShot
+    bus: FakeI2c
+    w: DeviceWiring
+
+impl Thermometer[hw] for OneShot
+    fn temp_start(self) -> Int [hw]
+        if dev_bus.wiring_write(self.bus, self.w, 0x01, [0x81 as u8, 0xa0 as u8])
+            return 35000
+        -1
+
+    fn temp_read(self) -> ?TempMilliC [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x00, 2)
+            Some(b) => Some(dev_thermo.temp_of_raw(((b[0] as Int << 8) | b[1] as Int) >> 4, 12, 62500))
+            None    => None
+
+impl ThermometerAsync[hw] for OneShot
+    async fn temp_measure(self) -> ?TempMilliC [hw]
+        // The double converts at once; a part on a scheduler parks here
+        // for the time `temp_start` answers.
+        let us = self.temp_start()
+        self.temp_read_after(us, us)
+
+fn at(hi: Int, lo: Int) -> OneShot
+    OneShot { bus: FakeI2c { addr: 0x48, regs: [hi, lo], expect: [0x01, 0x81, 0xa0] },
+              w: dev_bus.wiring_i2c(0, 0x48) }
+
+@test
+fn test_start_answers_the_conversion_time() [io, hw]
+    test.assert(at(0, 0).temp_start() == 35000)
+
+@test
+fn test_a_refused_start_answers_a_negative_time() [io, hw]
+    let p = OneShot { bus: FakeI2c { addr: 0x48, regs: [0, 0], expect: [] },
+        w: dev_bus.wiring_i2c(0, 0x48) }
+    test.assert(p.temp_start() < 0)
+    // A refused start refuses the read that follows it, however long
+    // the caller waited.
+    test.assert(p.temp_read_after(100000, p.temp_start()) == None)
+
+@test
+fn test_a_reading_is_in_milli_degrees() [io, hw]
+    // 25 °C is 400 steps of 1/16 °C: 0x190, left-justified 0x1900.
+    match at(0x19, 0x00).temp_read()
+        Some(t) => test.assert(t.milli_c == 25000)
+        None    => test.assert(false)
+    // -10.0625 °C is -161 steps: 0xf5f, left-justified 0xf5f0.
+    match at(0xf5, 0xf0).temp_read()
+        Some(t) => test.assert(t.milli_c == -10062)
+        None    => test.assert(false)
+
+@test
+fn test_an_early_read_is_refused() [io, hw]
+    let p = at(0x19, 0x00)
+    let us = p.temp_start()
+    test.assert(p.temp_read_after(us - 1, us) == None)
+    match p.temp_read_after(us, us)
+        Some(t) => test.assert(t.milli_c == 25000)
+        None    => test.assert(false)
+
+@test
+fn test_an_absent_part_answers_nothing() [io, hw]
+    let p = OneShot { bus: FakeI2c { addr: 0x49, regs: [0, 0], expect: [] },
+        w: dev_bus.wiring_i2c(0, 0x48) }
+    test.assert(p.temp_read() == None)
+
+@test
+fn test_the_async_form_measures_once() [io, hw, async]
+    match await at(0x19, 0x00).temp_measure()
+        Some(t) => test.assert(t.milli_c == 25000)
+        None    => test.assert(false)
+
+// ── A recorded reading ───────────────────────────────────────────────
+
+// A part that converts continuously, recorded: it answers 0 for the
+// conversion time and performs nothing.
+struct Logged
+    milli_c: Int
+
+impl Thermometer[] for Logged
+    fn temp_start(self) -> Int
+        0
+
+    fn temp_read(self) -> ?TempMilliC
+        Some(TempMilliC { milli_c: self.milli_c })
+
+fn too_hot<T: Thermometer[e]>(t: T, limit: Int) -> Bool [e]
+    match t.temp_read_after(0, t.temp_start())
+        Some(r) => r.milli_c > limit
+        None    => false
+
+@test
+fn test_a_continuous_part_reads_at_once()
+    test.assert(too_hot(Logged { milli_c: 85000 }, 80000))
+    test.assert(not too_hot(Logged { milli_c: 20000 }, 80000))
+
+// ── The conversion ───────────────────────────────────────────────────
+
+@test
+fn test_a_count_is_scaled_and_rounded_toward_zero() [io]
+    test.assert(dev_thermo.temp_of_raw(400, 12, 62500).milli_c == 25000)
+    test.assert(dev_thermo.temp_of_raw(1, 12, 62500).milli_c == 62)
+    test.assert(dev_thermo.temp_of_raw(0xfff, 12, 62500).milli_c == -62)
+    // A 10-bit part at 1/4 °C.
+    test.assert(dev_thermo.temp_of_raw(0x3ff, 10, 250000).milli_c == -250)
+
+@test
+fn test_fahrenheit_for_display() [io]
+    test.assert(dev_thermo.temp_milli_f(TempMilliC { milli_c: 0 }) == 32000)
+    test.assert(dev_thermo.temp_milli_f(TempMilliC { milli_c: 100000 }) == 212000)
+    test.assert(dev_thermo.temp_milli_f(TempMilliC { milli_c: -40000 }) == -40000)

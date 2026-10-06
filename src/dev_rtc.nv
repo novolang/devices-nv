@@ -1,0 +1,159 @@
+// dev_rtc — a real-time clock: a device that keeps the calendar date
+// and the time of day, on a backup battery while the board is off.
+//
+// A real-time clock (RTC) counts seconds from a 32.768 kHz crystal and
+// carries them into minutes, hours, days, months and years in its own
+// registers, leap years included.  It keeps counting on a coin cell or
+// a capacitor while the board's supply is off, which is its purpose.
+// If that backup fails the oscillator stops, and when power returns the
+// registers hold a time that looks valid and is not.  Parts record the
+// stop in a flag, and `rtc_running` reads it.
+//
+// Most parts store each field as binary-coded decimal (BCD): the tens
+// digit in the high four bits and the units digit in the low four, so
+// 59 seconds is the byte 0x59.  Some offer a 12-hour mode with an AM/PM
+// bit.  A time here is always in the 24-hour form, and the helpers
+// below convert both encodings.
+//
+// The calendar is the proleptic Gregorian one, and a time carries no
+// time zone: it is whatever the program set.
+
+// A calendar date and a time of day.  `year` is the full year, such as
+// 2026; `month` is 1 to 12; `day` is 1 to the month's length; `hour` is
+// 0 to 23; `minute` and `second` are 0 to 59.
+pub @value
+struct RtcDateTime
+    year: Int
+    month: Int
+    day: Int
+    hour: Int
+    minute: Int
+    second: Int
+
+// What a program reads from and sets on a real-time clock.
+//
+// `rtc_now` answers the time in the clock's registers, or `None` when
+// the device did not answer.  `rtc_set` sets the clock and answers
+// whether the device took it; a driver refuses a time `rtc_is_valid`
+// refuses.  `rtc_running` answers whether the oscillator has run
+// without stopping since the clock was last set.  `rtc_set_alarm` arms
+// the clock's alarm for a time, and `rtc_cancel_alarm` disarms it; each
+// answers whether the device took it.
+pub trait RealTimeClock[e]
+    fn rtc_now(self) -> ?RtcDateTime [e]
+    fn rtc_set(self, t: RtcDateTime) -> Bool [e]
+    fn rtc_running(self) -> Bool [e]
+    fn rtc_set_alarm(self, t: RtcDateTime) -> Bool [e]
+    fn rtc_cancel_alarm(self) -> Bool [e]
+
+    // The time, or `None` when the oscillator stopped since the clock
+    // was last set, because the registers then hold a time that is not
+    // the time.
+    fn rtc_now_valid(self) -> ?RtcDateTime [e]
+        if not self.rtc_running()
+            return None
+        self.rtc_now()
+
+// A real-time clock on a host's scheduler: `rtc_alarm_wait` parks the
+// task until the alarm armed with `rtc_set_alarm` fires, and answers the
+// time it fired at.
+pub trait RealTimeClockAsync[e]
+    async fn rtc_alarm_wait(self) -> ?RtcDateTime [e]
+
+// The value of a BCD byte: 0x59 is 59.
+//
+// ```novo
+// println("${dev_rtc.rtc_from_bcd(0x59)}")   // 59
+// ```
+pub fn rtc_from_bcd(b: Int) -> Int
+    (b >> 4) * 10 + (b & 0x0f)
+
+// The BCD byte for a value from 0 to 99: 59 is 0x59.
+pub fn rtc_to_bcd(n: Int) -> Int
+    ((n / 10) << 4) | (n % 10)
+
+// The hour of the 24-hour clock that a 12-hour reading means.  `hour12`
+// is 1 to 12 and `pm` is the AM/PM bit: 12 AM is midnight, hour 0, and
+// 12 PM is noon, hour 12.
+pub fn rtc_hour_24(hour12: Int, pm: Bool) -> Int
+    let h = hour12 % 12
+    if pm
+        h + 12
+    else
+        h
+
+// Whether `year` is a leap year of the Gregorian calendar: divisible by
+// 4, except a century that is not divisible by 400.
+pub fn rtc_is_leap_year(year: Int) -> Bool
+    year % 4 == 0 and year % 100 != 0 or year % 400 == 0
+
+// The number of days in `month` of `year`, or 0 for a month outside 1
+// to 12.
+pub fn rtc_days_in_month(year: Int, month: Int) -> Int
+    match month
+        1  => 31
+        2  => if rtc_is_leap_year(year)
+            29
+        else
+            28
+        3  => 31
+        4  => 30
+        5  => 31
+        6  => 30
+        7  => 31
+        8  => 31
+        9  => 30
+        10 => 31
+        11 => 30
+        12 => 31
+        _  => 0
+
+// Whether every field of `t` is in its range, the day included: 29
+// February is valid only in a leap year.
+pub fn rtc_is_valid(t: RtcDateTime) -> Bool
+    if t.month < 1 or t.month > 12
+        return false
+    if t.day < 1 or t.day > rtc_days_in_month(t.year, t.month)
+        return false
+    t.hour >= 0 and t.hour <= 23 and t.minute >= 0 and t.minute <= 59 and t.second >= 0 and t.second <= 59
+
+// The day of the week of a date, ISO 8601 numbering: 1 is Monday and 7
+// is Sunday.  A part with a weekday register takes it from here, since
+// the register is otherwise whatever was last written to it.
+//
+// ```novo
+// use dev_rtc.{ RtcDateTime }
+//
+// fn main() [io]
+//     let t = RtcDateTime { year: 2026, month: 10, day: 6, hour: 0, minute: 0, second: 0 }
+//     println("${dev_rtc.rtc_weekday(t)}")   // 2, a Tuesday
+// ```
+pub fn rtc_weekday(t: RtcDateTime) -> Int
+    // Sakamoto's method.  January and February are counted in the year
+    // before, so that the leap day falls at the end of the counted year.
+    let y = if t.month < 3
+        t.year - 1
+    else
+        t.year
+    let sunday0 = (y + y / 4 - y / 100 + y / 400 + month_offset(t.month) + t.day) % 7
+    if sunday0 == 0
+        7
+    else
+        sunday0
+
+// The month's term in Sakamoto's method, held in a match rather than a
+// list so that the weekday allocates nothing.
+fn month_offset(month: Int) -> Int
+    match month
+        1  => 0
+        2  => 3
+        3  => 2
+        4  => 5
+        5  => 0
+        6  => 3
+        7  => 5
+        8  => 1
+        9  => 4
+        10 => 6
+        11 => 2
+        _  => 4

@@ -1,0 +1,121 @@
+// dev_power — a power manager: a device that supplies a board's power
+// rails and charges its battery.
+//
+// A power-management integrated circuit (PMIC) takes one input, a
+// battery or a USB supply, and produces the board's rails: each rail is
+// a regulator output, a buck converter or a low-dropout regulator (LDO),
+// at a voltage the program sets within the regulator's range and in its
+// steps.  A rail is numbered as the part's data sheet numbers its
+// regulators, and the driver documents the mapping.  Most such parts
+// also charge a lithium battery, in the phases a charger moves through,
+// and measure the battery's voltage and current.
+//
+// Voltages are in millivolts and currents in milliamps, each its own
+// type, so a voltage cannot be passed where a current belongs.  A
+// battery current is positive into the battery, while it charges, and
+// negative out of it.
+
+// A voltage in millivolts.
+pub @value
+struct MilliVolts
+    mv: Int
+
+// A current in milliamps.
+pub @value
+struct MilliAmps
+    ma: Int
+
+// The state of one rail.  `RailFault` is a rail the part shut down, on
+// an over-current or a short.
+pub @value
+enum RailState
+    RailOff
+    RailOn
+    RailFault
+
+// The phase a battery charger is in.
+//
+// A lithium cell is charged at a low current while it is deeply
+// discharged (precharge), then at a constant current until it reaches
+// its termination voltage, then at that constant voltage while the
+// current falls, until the current falls below the termination current
+// and the charge is done.
+pub @value
+enum ChargeState
+    ChargeIdle
+    ChargePrecharge
+    ChargeConstantCurrent
+    ChargeConstantVoltage
+    ChargeDone
+    ChargeFault
+
+// One measurement of the battery.  `percent` is the state of charge, 0
+// to 100, from a part with a fuel gauge, and -1 from one without.
+pub @value
+struct BatteryReading
+    voltage: MilliVolts
+    current: MilliAmps
+    charge: ChargeState
+    percent: Int
+
+// What a program reads from and sets on a power manager.
+//
+// `rail_count` answers how many rails the part has; rails are numbered
+// from 0.  `rail_state` answers a rail's state, and `rail_voltage` its
+// set voltage, or `None` for a rail the part does not have.
+// `rail_set_voltage` sets a rail to the nearest step at or below the
+// request and answers the voltage it set, or `None` when the request is
+// below the rail's range or the device refused.  `rail_enable` turns a
+// rail on or off and answers whether the device took it.  `battery`
+// answers a measurement of the battery, or `None` when no battery is
+// connected or the device did not answer.
+pub trait PowerManager[e]
+    fn rail_count(self) -> Int [e]
+    fn rail_state(self, rail: Int) -> RailState [e]
+    fn rail_voltage(self, rail: Int) -> ?MilliVolts [e]
+    fn rail_set_voltage(self, rail: Int, v: MilliVolts) -> ?MilliVolts [e]
+    fn rail_enable(self, rail: Int, on: Bool) -> Bool [e]
+    fn battery(self) -> ?BatteryReading [e]
+
+    // Whether the rail is on and has not faulted.
+    fn rail_is_on(self, rail: Int) -> Bool [e]
+        self.rail_state(rail) == RailOn
+
+// A power manager on a host's scheduler: `battery_measure` starts a
+// measurement of the battery, parks the task until the part's converter
+// finishes and answers it.
+pub trait PowerManagerAsync[e]
+    async fn battery_measure(self) -> ?BatteryReading [e]
+
+// The voltage a regulator with the range `min_mv` to `max_mv` in steps of
+// `step_mv` sets for a request: the highest step at or below the
+// request, and never above `max_mv`.  Answers `None` for a request below
+// `min_mv`, and for a step that is not positive.  A driver uses it to
+// answer `rail_set_voltage`, since a rail set above its request can
+// damage what it supplies.
+//
+// ```novo
+// use dev_power.{ MilliVolts }
+//
+// fn main() [io]
+//     // A buck from 1000 to 3300 mV in 100 mV steps, asked for 1850 mV.
+//     match dev_power.power_step(MilliVolts { mv: 1850 }, 1000, 3300, 100)
+//         Some(v) => println("${v.mv}")       // 1800
+//         None => println("below the range")
+// ```
+pub fn power_step(request: MilliVolts, min_mv: Int, max_mv: Int, step_mv: Int) -> ?MilliVolts
+    if step_mv <= 0 or request.mv < min_mv
+        return None
+    let top = if request.mv > max_mv
+        max_mv
+    else
+        request.mv
+    Some(MilliVolts { mv: min_mv + (top - min_mv) / step_mv * step_mv })
+
+// Whether a charger in this phase is charging.
+pub fn power_is_charging(s: ChargeState) -> Bool
+    match s
+        ChargePrecharge       => true
+        ChargeConstantCurrent => true
+        ChargeConstantVoltage => true
+        _                     => false

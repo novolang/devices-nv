@@ -1,0 +1,358 @@
+// accel_tests — the accelerometer trait implemented by two drivers, one
+// over the I2C double and one over the SPI double, and by a recorded
+// sample that performs nothing; the range and the count conversion.
+
+use std.test
+use embedded_hal.{ I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer, AccelerometerAsync }
+
+// ── Doubles ──────────────────────────────────────────────────────────
+//
+// A trait method's receiver is a plain `self`, so a double cannot
+// record its calls.  Each double answers from fixed data instead: the
+// I2C double acknowledges one write frame, and the SPI and GPIO doubles
+// panic on the one call a test names (`trip`), which
+// `test.assert_raises` observes.
+
+// An I2C bus with one device at `addr`.  Register r reads `regs[r]`, and
+// a multi-byte read continues through the following registers.  A write
+// is acknowledged when it reaches `addr` and its bytes are `expect`.
+struct FakeI2c
+    addr: Int
+    regs: [Int]
+    expect: [Int]
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr or data.len() != self.expect.len()
+            return false
+        for i in 0..data.len()
+            if (data[i] as Int) != self.expect[i]
+                return false
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[i] as u8)
+        Some(out)
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        let r = tx[0] as Int
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[r + i] as u8)
+        Some(out)
+
+// An SPI bus whose reads answer `rx`, from its first byte.  A write
+// whose first byte is `trip` panics.
+struct FakeSpi
+    rx: [Int]
+    trip: Int
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        pass
+
+    fn transfer(self, b: Int) -> Int [hw]
+        self.rx[0]
+
+    fn write(self, data: [u8]) [hw]
+        if data.len() > 0 and (data[0] as Int) == self.trip
+            panic.panic("spi write")
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.rx[i] as u8)
+        out
+
+// A GPIO port.  A write of `val` to `pin` panics when pin * 10 + val
+// equals `trip`.
+struct FakePins
+    trip: Int
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        pass
+
+    fn set(self, pin: Int, val: Int) [hw]
+        if pin * 10 + val == self.trip
+            panic.panic("gpio set")
+
+    fn get(self, pin: Int) -> Int [hw]
+        0
+
+// ── A driver over I2C ────────────────────────────────────────────────
+//
+// A three-axis part laid out as ST's LIS3DH is: the data-ready flag is
+// bit 3 of STATUS (0x27); the axes are six bytes from OUT_X_L (0x28),
+// each little-endian and left-justified to 12 bits; the full scale is
+// bits 5 and 4 of CTRL_REG4 (0x23); and the output data rate is the top
+// four bits of CTRL_REG1 (0x20).  The part here auto-increments its
+// register pointer on a multi-byte read.
+
+struct I2cAccel
+    bus: FakeI2c
+    w: DeviceWiring
+
+fn range_of_code(code: Int) -> AccelRange
+    match code
+        0 => AccelRange2g
+        1 => AccelRange4g
+        2 => AccelRange8g
+        _ => AccelRange16g
+
+fn code_of_range(r: AccelRange) -> Int
+    match r
+        AccelRange2g  => 0
+        AccelRange4g  => 1
+        AccelRange8g  => 2
+        AccelRange16g => 3
+
+fn rate_of_code(code: Int) -> Int
+    match code
+        1 => 1
+        2 => 10
+        3 => 25
+        4 => 50
+        5 => 100
+        _ => 0
+
+// The milli-g of one axis whose low byte is at `i`.
+fn axis(b: [u8], i: Int, r: AccelRange) -> Int
+    let raw = ((b[i + 1] as Int << 8) | b[i] as Int) >> 4
+    dev_accel.accel_milli_g(raw, 12, r)
+
+impl Accelerometer[hw] for I2cAccel
+    fn accel_read(self) -> ?AccelMilliG [hw]
+        let r = self.accel_range()
+        match dev_bus.wiring_read(self.bus, self.w, 0x28, 6)
+            Some(b) => Some(AccelMilliG { x: axis(b, 0, r), y: axis(b, 2, r), z: axis(b, 4, r) })
+            None    => None
+
+    fn accel_ready(self) -> Bool [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x27, 1)
+            Some(b) => (b[0] as Int & 0x08) != 0
+            None    => false
+
+    fn accel_range(self) -> AccelRange [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x23, 1)
+            Some(b) => range_of_code((b[0] as Int >> 4) & 3)
+            None    => AccelRange2g
+
+    fn accel_set_range(self, r: AccelRange) -> Bool [hw]
+        dev_bus.wiring_write(self.bus, self.w, 0x23, [(code_of_range(r) << 4) as u8])
+
+    fn accel_rate_hz(self) -> Int [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x20, 1)
+            Some(b) => rate_of_code(b[0] as Int >> 4)
+            None    => 0
+
+impl AccelerometerAsync[hw] for I2cAccel
+    async fn accel_next(self) -> ?AccelMilliG [hw]
+        self.accel_read_new()
+
+// The register file of a part at rest, flat on a table: x and y read
+// 0 g and z reads +1 g, at ±2 g and 100 Hz, with a sample waiting when
+// `ready` is set.
+fn at_rest(ready: Bool) -> [Int]
+    var regs = list.zeros(48)
+    regs[0x20] = 0x57
+    regs[0x23] = 0x00
+    regs[0x27] = if ready
+        0x08
+    else
+        0x00
+    // z = 1024 counts of 12 bits, left-justified: 0x4000.
+    regs[0x2c] = 0x00
+    regs[0x2d] = 0x40
+    regs
+
+fn part(regs: [Int], expect: [Int]) -> I2cAccel
+    I2cAccel { bus: FakeI2c { addr: 0x18, regs: regs, expect: expect },
+        w: dev_bus.wiring_i2c(0, 0x18) }
+
+@test
+fn test_a_part_at_rest_reads_one_g_on_z() [io, hw]
+    match part(at_rest(true), []).accel_read()
+        Some(a) =>
+            test.assert(a.x == 0)
+            test.assert(a.y == 0)
+            test.assert(a.z == 1000)
+        None    => test.assert(false)
+
+@test
+fn test_a_negative_axis_reads_below_zero() [io, hw]
+    var regs = at_rest(true)
+    // x = -512 counts: 0xe00 left-justified is 0xe000.
+    regs[0x28] = 0x00
+    regs[0x29] = 0xe0
+    match part(regs, []).accel_read()
+        Some(a) => test.assert(a.x == -500)
+        None    => test.assert(false)
+
+@test
+fn test_the_range_scales_the_reading() [io, hw]
+    var regs = at_rest(true)
+    regs[0x23] = 0x20
+    let p = part(regs, [])
+    test.assert(p.accel_range() == AccelRange8g)
+    match p.accel_read()
+        Some(a) => test.assert(a.z == 4000)
+        None    => test.assert(false)
+
+@test
+fn test_an_absent_part_answers_nothing() [io, hw]
+    let p = I2cAccel { bus: FakeI2c { addr: 0x19, regs: at_rest(true), expect: [] },
+                       w: dev_bus.wiring_i2c(0, 0x18) }
+    test.assert(p.accel_read() == None)
+    test.assert(not p.accel_ready())
+    test.assert(p.accel_range() == AccelRange2g)
+    test.assert(p.accel_rate_hz() == 0)
+
+@test
+fn test_set_range_writes_the_full_scale_bits() [io, hw]
+    test.assert(part(at_rest(true), [0x23, 0x30]).accel_set_range(AccelRange16g))
+    test.assert(not part(at_rest(true), [0x23, 0x30]).accel_set_range(AccelRange4g))
+
+@test
+fn test_the_rate_is_read_from_the_part() [io, hw]
+    test.assert(part(at_rest(true), []).accel_rate_hz() == 100)
+
+@test
+fn test_read_new_answers_only_a_new_sample() [io, hw]
+    test.assert(part(at_rest(false), []).accel_read_new() == None)
+    match part(at_rest(true), []).accel_read_new()
+        Some(a) => test.assert(a.z == 1000)
+        None    => test.assert(false)
+
+@test
+fn test_the_async_form_answers_the_next_sample() [io, hw, async]
+    match await part(at_rest(true), []).accel_next()
+        Some(a) => test.assert(a.z == 1000)
+        None    => test.assert(false)
+    test.assert(await part(at_rest(false), []).accel_next() == None)
+
+// ── A driver over SPI ────────────────────────────────────────────────
+//
+// The same part on SPI: a read sets the top bit of the register address
+// and the next bit to auto-increment, inside one chip-select window.
+
+struct SpiAccel
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+
+impl Accelerometer[hw] for SpiAccel
+    fn accel_read(self) -> ?AccelMilliG [hw]
+        let b = dev_bus.wiring_spi_exchange(self.bus, self.pins, self.w, [(0x80 | 0x40 | 0x28) as u8], 6)
+        if b.len() != 6
+            return None
+        Some(AccelMilliG { x: axis(b, 0, AccelRange2g),
+            y: axis(b, 2, AccelRange2g),
+            z: axis(b, 4, AccelRange2g) })
+
+    fn accel_ready(self) -> Bool [hw]
+        true
+
+    fn accel_range(self) -> AccelRange [hw]
+        AccelRange2g
+
+    fn accel_set_range(self, r: AccelRange) -> Bool [hw]
+        false
+
+    fn accel_rate_hz(self) -> Int [hw]
+        100
+
+@test
+fn test_a_part_on_spi_reads_its_axes_in_one_window() [io, hw]
+    let p = SpiAccel { bus: FakeSpi { rx: [0x00, 0x10, 0x00, 0xf0, 0x00, 0x40], trip: -1 },
+                       pins: FakePins { trip: -1 }, w: dev_bus.wiring_spi(0, 5) }
+    match p.accel_read()
+        Some(a) =>
+            test.assert(a.x == 250)
+            test.assert(a.y == -250)
+            test.assert(a.z == 1000)
+        None    => test.assert(false)
+    test.assert(p.accel_ready())
+    test.assert(p.accel_range() == AccelRange2g)
+    test.assert(not p.accel_set_range(AccelRange4g))
+    test.assert(p.accel_rate_hz() == 100)
+
+@test
+fn test_a_part_wired_without_a_chip_select_answers_nothing() [io, hw]
+    let p = SpiAccel { bus: FakeSpi { rx: [0, 0, 0, 0, 0, 0], trip: -1 },
+                       pins: FakePins { trip: -1 }, w: dev_bus.wiring_i2c(0, 0x18) }
+    test.assert(p.accel_read() == None)
+
+// ── A caller that charges what the device charges ────────────────────
+
+// A recorded sample: reading it performs nothing.
+struct Recorded
+    z: Int
+
+impl Accelerometer[] for Recorded
+    fn accel_read(self) -> ?AccelMilliG
+        Some(AccelMilliG { x: 0, y: 0, z: self.z })
+
+    fn accel_ready(self) -> Bool
+        true
+
+    fn accel_range(self) -> AccelRange
+        AccelRange2g
+
+    fn accel_set_range(self, r: AccelRange) -> Bool
+        r == AccelRange2g
+
+    fn accel_rate_hz(self) -> Int
+        0
+
+// Whether the board lies face down.  Generic over the device and its
+// effect, so this caller declares nothing for a recorded sample.
+fn face_down<A: Accelerometer[e]>(a: A) -> Bool [e]
+    match a.accel_read()
+        Some(s) => s.z < -500
+        None    => false
+
+@test
+fn test_a_recorded_sample_needs_no_hardware()
+    test.assert(face_down(Recorded { z: -1000 }))
+    test.assert(not face_down(Recorded { z: 1000 }))
+    test.assert(Recorded { z: 0 }.accel_set_range(AccelRange2g))
+    test.assert(Recorded { z: 0 }.accel_read_new() != None)
+
+// ── The range and the conversion ─────────────────────────────────────
+
+@test
+fn test_full_scale_of_each_range() [io]
+    test.assert(dev_accel.accel_full_scale(AccelRange2g) == 2000)
+    test.assert(dev_accel.accel_full_scale(AccelRange4g) == 4000)
+    test.assert(dev_accel.accel_full_scale(AccelRange8g) == 8000)
+    test.assert(dev_accel.accel_full_scale(AccelRange16g) == 16000)
+
+@test
+fn test_the_narrowest_range_that_reaches_a_peak() [io]
+    test.assert(dev_accel.accel_range_for(0) == Some(AccelRange2g))
+    test.assert(dev_accel.accel_range_for(2000) == Some(AccelRange2g))
+    test.assert(dev_accel.accel_range_for(-2001) == Some(AccelRange4g))
+    test.assert(dev_accel.accel_range_for(8000) == Some(AccelRange8g))
+    test.assert(dev_accel.accel_range_for(12000) == Some(AccelRange16g))
+    test.assert(dev_accel.accel_range_for(16001) == None)
+
+@test
+fn test_a_count_is_scaled_to_milli_g() [io]
+    test.assert(dev_accel.accel_milli_g(1024, 12, AccelRange2g) == 1000)
+    test.assert(dev_accel.accel_milli_g(0xc00, 12, AccelRange2g) == -1000)
+    test.assert(dev_accel.accel_milli_g(2047, 12, AccelRange16g) == 15992)
+    // 10-bit and 16-bit parts.
+    test.assert(dev_accel.accel_milli_g(256, 10, AccelRange4g) == 2000)
+    test.assert(dev_accel.accel_milli_g(0x8000, 16, AccelRange2g) == -2000)

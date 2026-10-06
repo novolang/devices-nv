@@ -1,0 +1,117 @@
+// dev_accel — an accelerometer: a device that measures acceleration
+// along three axes.
+//
+// An accelerometer at rest reads the acceleration of gravity, 1 g or
+// about 9.81 m/s², along whichever axis points up, so its reading also
+// tells a program which way the board is tilted.  A reading here is in
+// thousandths of g (milli-g) per axis, the unit the parts' data sheets
+// state their sensitivity in.
+//
+// The part measures within a range, its full scale: ±2 g, ±4 g, ±8 g or
+// ±16 g.  A wider range reaches larger accelerations and resolves small
+// ones more coarsely, because the same number of bits spans more of
+// them.  The range is a type, `AccelRange`, so a program cannot pass a
+// number the part does not support.
+//
+// The part samples at a fixed rate and sets a data-ready flag, and on
+// most parts pulses an interrupt line, when a new sample is complete.
+// Reading before then answers the previous sample again.
+
+use dev_bus.{ dev_sign_extend }
+
+// One sample: the acceleration along each axis, in milli-g.
+pub @value
+struct AccelMilliG
+    x: Int
+    y: Int
+    z: Int
+
+// The full-scale range of an accelerometer.
+pub @value
+enum AccelRange
+    AccelRange2g
+    AccelRange4g
+    AccelRange8g
+    AccelRange16g
+
+// What a program reads from an accelerometer.
+//
+// `accel_read` answers the most recent sample, or `None` when the device
+// did not answer.  `accel_ready` answers whether a sample has completed
+// since the last read, from the part's data-ready flag.  `accel_range`
+// and `accel_set_range` read and change the full scale; the setter
+// answers whether the device took it.  `accel_rate_hz` answers the
+// sample rate in samples per second.
+pub trait Accelerometer[e]
+    fn accel_read(self) -> ?AccelMilliG [e]
+    fn accel_ready(self) -> Bool [e]
+    fn accel_range(self) -> AccelRange [e]
+    fn accel_set_range(self, r: AccelRange) -> Bool [e]
+    fn accel_rate_hz(self) -> Int [e]
+
+    // A new sample, or `None` when none has completed since the last
+    // read or the device did not answer.  A loop that polls this never
+    // counts one sample twice.
+    fn accel_read_new(self) -> ?AccelMilliG [e]
+        if not self.accel_ready()
+            return None
+        self.accel_read()
+
+// An accelerometer on a host's scheduler: `accel_next` parks the task
+// until the part's next sample is complete and answers it.  At
+// `@tier(embedded)` a device implements `dev_bus.AsyncDeviceReady`
+// instead.
+pub trait AccelerometerAsync[e]
+    async fn accel_next(self) -> ?AccelMilliG [e]
+
+// The full scale of a range in milli-g: 2000, 4000, 8000 or 16000.
+//
+// ```novo
+// use dev_accel.{ AccelRange }
+//
+// fn main() [io]
+//     println("${dev_accel.accel_full_scale(AccelRange.AccelRange4g)}")   // 4000
+// ```
+pub fn accel_full_scale(r: AccelRange) -> Int
+    match r
+        AccelRange2g  => 2000
+        AccelRange4g  => 4000
+        AccelRange8g  => 8000
+        AccelRange16g => 16000
+
+// The narrowest range whose full scale reaches `peak` milli-g, or `None`
+// when `peak` is beyond ±16 g.  The narrowest range that fits gives the
+// finest resolution.
+pub fn accel_range_for(peak: Int) -> ?AccelRange
+    let p = if peak < 0
+        0 - peak
+    else
+        peak
+    if p <= 2000
+        return Some(AccelRange2g)
+    if p <= 4000
+        return Some(AccelRange4g)
+    if p <= 8000
+        return Some(AccelRange8g)
+    if p <= 16000
+        return Some(AccelRange16g)
+    None
+
+// The acceleration in milli-g that a raw count means.
+//
+// `raw` is the axis's count right-justified, as read from its registers
+// and shifted down, and `bits` is how many bits it has.  The count is
+// two's complement, and its largest magnitude, 2^(bits-1), is the full
+// scale of `r`.  The answer is the nominal one: a data sheet gives the
+// part's sensitivity with a tolerance of a few percent, and a program
+// that needs better calibrates the part.
+//
+// ```novo
+// use dev_accel.{ AccelRange }
+//
+// fn main() [io]
+//     // A 12-bit count of 1024 at ±2 g is half of full scale.
+//     println("${dev_accel.accel_milli_g(1024, 12, AccelRange.AccelRange2g)}")   // 1000
+// ```
+pub fn accel_milli_g(raw: Int, bits: Int, r: AccelRange) -> Int
+    dev_sign_extend(raw, bits) * accel_full_scale(r) / (1 << (bits - 1))

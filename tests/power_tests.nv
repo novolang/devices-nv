@@ -1,0 +1,350 @@
+// power_tests — the power-manager trait implemented by a driver over
+// the I2C double and by a bench supply that performs nothing; the
+// regulator step and the charger phases.
+
+use std.test
+use embedded_hal.{ I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring }
+use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, PowerManager, PowerManagerAsync }
+
+// ── Doubles ──────────────────────────────────────────────────────────
+//
+// A trait method's receiver is a plain `self`, so a double cannot
+// record its calls.  Each double answers from fixed data instead: the
+// I2C double acknowledges one write frame, and the SPI and GPIO doubles
+// panic on the one call a test names (`trip`), which
+// `test.assert_raises` observes.
+
+// An I2C bus with one device at `addr`.  Register r reads `regs[r]`, and
+// a multi-byte read continues through the following registers.  A write
+// is acknowledged when it reaches `addr` and its bytes are `expect`.
+struct FakeI2c
+    addr: Int
+    regs: [Int]
+    expect: [Int]
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr or data.len() != self.expect.len()
+            return false
+        for i in 0..data.len()
+            if (data[i] as Int) != self.expect[i]
+                return false
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[i] as u8)
+        Some(out)
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        let r = tx[0] as Int
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[r + i] as u8)
+        Some(out)
+
+// An SPI bus whose reads answer `rx`, from its first byte.  A write
+// whose first byte is `trip` panics.
+struct FakeSpi
+    rx: [Int]
+    trip: Int
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        pass
+
+    fn transfer(self, b: Int) -> Int [hw]
+        self.rx[0]
+
+    fn write(self, data: [u8]) [hw]
+        if data.len() > 0 and (data[0] as Int) == self.trip
+            panic.panic("spi write")
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.rx[i] as u8)
+        out
+
+// A GPIO port.  A write of `val` to `pin` panics when pin * 10 + val
+// equals `trip`.
+struct FakePins
+    trip: Int
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        pass
+
+    fn set(self, pin: Int, val: Int) [hw]
+        if pin * 10 + val == self.trip
+            panic.panic("gpio set")
+
+    fn get(self, pin: Int) -> Int [hw]
+        0
+
+// ── A driver over I2C ────────────────────────────────────────────────
+//
+// A part with two buck regulators, rails 0 and 1, from 1000 to 3300 mV
+// in 100 mV steps.  STATUS (0x04) has bit r set while rail r is on and
+// bit r + 4 set when it has faulted.  Rail r's voltage code, the steps
+// above 1000 mV, is register 0x08 + r, and writing 1 or 0 to register
+// 0x0c + r turns it on or off.  The battery is measured into 0x10 to
+// 0x15: the voltage in millivolts and the current in milliamps, each
+// big-endian with the current signed, the charger phase as a code, and
+// the state of charge in percent, 0xff when the part has no fuel gauge.
+
+struct Pmic
+    bus: FakeI2c
+    w: DeviceWiring
+
+fn phase_of_code(code: Int) -> ChargeState
+    match code
+        1 => ChargePrecharge
+        2 => ChargeConstantCurrent
+        3 => ChargeConstantVoltage
+        4 => ChargeDone
+        5 => ChargeFault
+        _ => ChargeIdle
+
+impl PowerManager[hw] for Pmic
+    fn rail_count(self) -> Int [hw]
+        2
+
+    fn rail_state(self, rail: Int) -> RailState [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x04, 1)
+            Some(b) =>
+                let s = b[0] as Int
+                if ((s >> (rail + 4)) & 1) == 1
+                    return RailFault
+                if ((s >> rail) & 1) == 1
+                    return RailOn
+                RailOff
+            None    => RailFault
+
+    fn rail_voltage(self, rail: Int) -> ?MilliVolts [hw]
+        if rail < 0 or rail >= self.rail_count()
+            return None
+        match dev_bus.wiring_read(self.bus, self.w, 0x08 + rail, 1)
+            Some(b) => Some(MilliVolts { mv: 1000 + b[0] as Int * 100 })
+            None    => None
+
+    fn rail_set_voltage(self, rail: Int, v: MilliVolts) -> ?MilliVolts [hw]
+        if rail < 0 or rail >= self.rail_count()
+            return None
+        match dev_power.power_step(v, 1000, 3300, 100)
+            Some(set) =>
+                if dev_bus.wiring_write(self.bus, self.w, 0x08 + rail, [((set.mv - 1000) / 100) as u8])
+                    return Some(set)
+                None
+            None      => None
+
+    fn rail_enable(self, rail: Int, on: Bool) -> Bool [hw]
+        dev_bus.wiring_write(self.bus, self.w, 0x0c + rail, [(if on then 1 else 0) as u8])
+
+    fn battery(self) -> ?BatteryReading [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x10, 6)
+            Some(b) =>
+                let mv = (b[0] as Int << 8) | b[1] as Int
+                if mv == 0
+                    return None
+                let ma = dev_bus.dev_sign_extend((b[2] as Int << 8) | b[3] as Int, 16)
+                let pct = if (b[5] as Int) == 0xff
+                    -1
+                else
+                    b[5] as Int
+                Some(BatteryReading { voltage: MilliVolts { mv: mv }, current: MilliAmps { ma: ma },
+                                      charge: phase_of_code(b[4] as Int), percent: pct })
+            None    => None
+
+impl PowerManagerAsync[hw] for Pmic
+    async fn battery_measure(self) -> ?BatteryReading [hw]
+        self.battery()
+
+// Registers 0x00 to 0x15 with rail 0 on at 1800 mV, rail 1 faulted, and
+// a battery at 3700 mV charging at 120 mA in the constant-current
+// phase, 64 percent full.
+fn regs() -> [Int]
+    var r = list.zeros(22)
+    r[0x04] = 0x21
+    r[0x08] = 8
+    r[0x09] = 22
+    r[0x10] = 0x0e
+    r[0x11] = 0x74
+    r[0x12] = 0x00
+    r[0x13] = 0x78
+    r[0x14] = 2
+    r[0x15] = 64
+    r
+
+fn pmic(r: [Int], expect: [Int]) -> Pmic
+    Pmic { bus: FakeI2c { addr: 0x6b, regs: r, expect: expect }, w: dev_bus.wiring_i2c(0, 0x6b) }
+
+@test
+fn test_rail_states_are_read_from_status() [io, hw]
+    let p = pmic(regs(), [])
+    test.assert(p.rail_count() == 2)
+    test.assert(p.rail_state(0) == RailOn)
+    test.assert(p.rail_state(1) == RailFault)
+    test.assert(p.rail_is_on(0))
+    test.assert(not p.rail_is_on(1))
+    var off = regs()
+    off[0x04] = 0x00
+    test.assert(pmic(off, []).rail_state(0) == RailOff)
+
+@test
+fn test_rail_voltage_is_the_step_code_in_millivolts() [io, hw]
+    let p = pmic(regs(), [])
+    match p.rail_voltage(0)
+        Some(v) => test.assert(v.mv == 1800)
+        None    => test.assert(false)
+    match p.rail_voltage(1)
+        Some(v) => test.assert(v.mv == 3200)
+        None    => test.assert(false)
+    test.assert(p.rail_voltage(2) == None)
+    test.assert(p.rail_voltage(-1) == None)
+
+@test
+fn test_set_voltage_rounds_down_to_a_step_and_writes_its_code() [io, hw]
+    // 1850 mV is set as 1800 mV, code 8, into rail 1's register 0x09.
+    match pmic(regs(), [0x09, 8]).rail_set_voltage(1, MilliVolts { mv: 1850 })
+        Some(v) => test.assert(v.mv == 1800)
+        None    => test.assert(false)
+    // Below the range, on a rail the part lacks, or refused by the part.
+    test.assert(pmic(regs(), [0x09, 8]).rail_set_voltage(1, MilliVolts { mv: 900 }) == None)
+    test.assert(pmic(regs(), [0x09, 8]).rail_set_voltage(5, MilliVolts { mv: 1800 }) == None)
+    test.assert(pmic(regs(), [0x09, 9]).rail_set_voltage(1, MilliVolts { mv: 1800 }) == None)
+
+@test
+fn test_enable_writes_the_rail_s_switch() [io, hw]
+    test.assert(pmic(regs(), [0x0d, 1]).rail_enable(1, true))
+    test.assert(pmic(regs(), [0x0c, 0]).rail_enable(0, false))
+    test.assert(not pmic(regs(), [0x0c, 0]).rail_enable(0, true))
+
+@test
+fn test_a_battery_measurement() [io, hw]
+    match pmic(regs(), []).battery()
+        Some(b) =>
+            test.assert(b.voltage.mv == 3700)
+            test.assert(b.current.ma == 120)
+            test.assert(b.charge == ChargeConstantCurrent)
+            test.assert(b.percent == 64)
+            test.assert(dev_power.power_is_charging(b.charge))
+        None    => test.assert(false)
+
+@test
+fn test_a_discharging_battery_without_a_fuel_gauge() [io, hw]
+    var r = regs()
+    // -250 mA is 0xff06; no gauge reads 0xff; the charger is idle.
+    r[0x12] = 0xff
+    r[0x13] = 0x06
+    r[0x14] = 0
+    r[0x15] = 0xff
+    match pmic(r, []).battery()
+        Some(b) =>
+            test.assert(b.current.ma == -250)
+            test.assert(b.percent == -1)
+            test.assert(not dev_power.power_is_charging(b.charge))
+        None    => test.assert(false)
+
+@test
+fn test_no_battery_and_an_absent_part_answer_nothing() [io, hw]
+    var r = regs()
+    r[0x10] = 0
+    r[0x11] = 0
+    test.assert(pmic(r, []).battery() == None)
+    let gone = Pmic { bus: FakeI2c { addr: 0x6c, regs: regs(), expect: [] }, w: dev_bus.wiring_i2c(0, 0x6b) }
+    test.assert(gone.battery() == None)
+    test.assert(gone.rail_voltage(0) == None)
+    test.assert(gone.rail_state(0) == RailFault)
+
+@test
+fn test_the_async_form_measures_the_battery() [io, hw, async]
+    match await pmic(regs(), []).battery_measure()
+        Some(b) => test.assert(b.voltage.mv == 3700)
+        None    => test.assert(false)
+
+// ── A bench supply ───────────────────────────────────────────────────
+
+// One fixed rail and no battery, performing nothing.
+struct Bench
+    mv: Int
+
+impl PowerManager[] for Bench
+    fn rail_count(self) -> Int
+        1
+
+    fn rail_state(self, rail: Int) -> RailState
+        if rail == 0
+            RailOn
+        else
+            RailOff
+
+    fn rail_voltage(self, rail: Int) -> ?MilliVolts
+        if rail == 0
+            Some(MilliVolts { mv: self.mv })
+        else
+            None
+
+    fn rail_set_voltage(self, rail: Int, v: MilliVolts) -> ?MilliVolts
+        None
+
+    fn rail_enable(self, rail: Int, on: Bool) -> Bool
+        false
+
+    fn battery(self) -> ?BatteryReading
+        None
+
+fn powered<P: PowerManager[e]>(p: P) -> Int [e]
+    var n = 0
+    for r in 0..p.rail_count()
+        if p.rail_is_on(r)
+            n = n + 1
+    n
+
+@test
+fn test_a_bench_supply_needs_no_hardware()
+    let b = Bench { mv: 3300 }
+    test.assert(powered(b) == 1)
+    test.assert(b.rail_set_voltage(0, MilliVolts { mv: 1800 }) == None)
+    test.assert(not b.rail_enable(0, false))
+    test.assert(b.battery() == None)
+    test.assert(b.rail_voltage(1) == None)
+
+// ── The regulator step and the charger phases ────────────────────────
+
+@test
+fn test_the_step_is_the_highest_at_or_below_the_request() [io]
+    match dev_power.power_step(MilliVolts { mv: 1850 }, 1000, 3300, 100)
+        Some(v) => test.assert(v.mv == 1800)
+        None    => test.assert(false)
+    match dev_power.power_step(MilliVolts { mv: 1000 }, 1000, 3300, 100)
+        Some(v) => test.assert(v.mv == 1000)
+        None    => test.assert(false)
+    // Above the range the rail is set to its top step.
+    match dev_power.power_step(MilliVolts { mv: 5000 }, 1000, 3300, 100)
+        Some(v) => test.assert(v.mv == 3300)
+        None    => test.assert(false)
+    // A range whose top is off the step grid stops at the last step.
+    match dev_power.power_step(MilliVolts { mv: 3350 }, 1000, 3350, 100)
+        Some(v) => test.assert(v.mv == 3300)
+        None    => test.assert(false)
+    test.assert(dev_power.power_step(MilliVolts { mv: 999 }, 1000, 3300, 100) == None)
+    test.assert(dev_power.power_step(MilliVolts { mv: 1800 }, 1000, 3300, 0) == None)
+
+@test
+fn test_the_charging_phases() [io]
+    test.assert(dev_power.power_is_charging(ChargePrecharge))
+    test.assert(dev_power.power_is_charging(ChargeConstantCurrent))
+    test.assert(dev_power.power_is_charging(ChargeConstantVoltage))
+    test.assert(not dev_power.power_is_charging(ChargeIdle))
+    test.assert(not dev_power.power_is_charging(ChargeDone))
+    test.assert(not dev_power.power_is_charging(ChargeFault))

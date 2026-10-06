@@ -1,0 +1,244 @@
+// bus_tests — a device's wiring, register access over the I2C and SPI
+// doubles, and an interrupt line awaited through `AsyncDeviceReady`.
+
+use std.test
+use core.rt
+use embedded_hal.{ I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, AsyncDeviceReady }
+
+// ── Doubles ──────────────────────────────────────────────────────────
+//
+// A trait method's receiver is a plain `self`, so a double cannot
+// record its calls.  Each double answers from fixed data instead: the
+// I2C double acknowledges one write frame, and the SPI and GPIO doubles
+// panic on the one call a test names (`trip`), which
+// `test.assert_raises` observes.
+
+// An I2C bus with one device at `addr`.  Register r reads `regs[r]`, and
+// a multi-byte read continues through the following registers.  A write
+// is acknowledged when it reaches `addr` and its bytes are `expect`.
+struct FakeI2c
+    addr: Int
+    regs: [Int]
+    expect: [Int]
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr or data.len() != self.expect.len()
+            return false
+        for i in 0..data.len()
+            if (data[i] as Int) != self.expect[i]
+                return false
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[i] as u8)
+        Some(out)
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        let r = tx[0] as Int
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[r + i] as u8)
+        Some(out)
+
+// An SPI bus whose reads answer `rx`, from its first byte.  A write
+// whose first byte is `trip` panics.
+struct FakeSpi
+    rx: [Int]
+    trip: Int
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        pass
+
+    fn transfer(self, b: Int) -> Int [hw]
+        self.rx[0]
+
+    fn write(self, data: [u8]) [hw]
+        if data.len() > 0 and (data[0] as Int) == self.trip
+            panic.panic("spi write")
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.rx[i] as u8)
+        out
+
+// A GPIO port.  A write of `val` to `pin` panics when pin * 10 + val
+// equals `trip`.
+struct FakePins
+    trip: Int
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        pass
+
+    fn set(self, pin: Int, val: Int) [hw]
+        if pin * 10 + val == self.trip
+            panic.panic("gpio set")
+
+    fn get(self, pin: Int) -> Int [hw]
+        0
+
+// ── Wiring ───────────────────────────────────────────────────────────
+
+@test
+fn test_an_i2c_wiring_has_an_address_and_no_chip_select() [io]
+    let w = dev_bus.wiring_i2c(1, 0x18)
+    test.assert(w.bus == 1)
+    test.assert(w.addr == 0x18)
+    test.assert(w.cs == -1)
+    test.assert(not dev_bus.wiring_is_spi(w))
+    test.assert(not dev_bus.wiring_has_irq(w))
+
+@test
+fn test_an_spi_wiring_has_a_chip_select_and_no_address() [io]
+    let w = dev_bus.wiring_spi(0, 17)
+    test.assert(w.addr == -1)
+    test.assert(w.cs == 17)
+    test.assert(dev_bus.wiring_is_spi(w))
+
+@test
+fn test_an_interrupt_line_keeps_the_rest_of_the_wiring() [io]
+    let w = dev_bus.wiring_irq(dev_bus.wiring_i2c(2, 0x6b), 26)
+    test.assert(dev_bus.wiring_has_irq(w))
+    test.assert(w.irq == 26)
+    test.assert(w.bus == 2)
+    test.assert(w.addr == 0x6b)
+
+// ── Register access over I2C ─────────────────────────────────────────
+
+fn bus() -> FakeI2c
+    FakeI2c { addr: 0x18, regs: [0, 0x33, 0x44, 0x55], expect: [0x20, 0x57, 0x01] }
+
+@test
+fn test_wiring_read_reads_consecutive_registers_in_one_transaction() [io, hw]
+    match dev_bus.wiring_read(bus(), dev_bus.wiring_i2c(0, 0x18), 1, 3)
+        Some(b) =>
+            test.assert(b.len() == 3)
+            test.assert((b[0] as Int) == 0x33)
+            test.assert((b[2] as Int) == 0x55)
+        None    => test.assert(false)
+
+@test
+fn test_wiring_read_of_an_absent_device_is_none() [io, hw]
+    test.assert(dev_bus.wiring_read(bus(), dev_bus.wiring_i2c(0, 0x19), 1, 1) == None)
+
+@test
+fn test_wiring_read_of_an_spi_device_is_none() [io, hw]
+    test.assert(dev_bus.wiring_read(bus(), dev_bus.wiring_spi(0, 4), 1, 1) == None)
+
+@test
+fn test_wiring_write_sends_the_register_then_the_bytes() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x18)
+    test.assert(dev_bus.wiring_write(bus(), w, 0x20, [0x57 as u8, 0x01 as u8]))
+    // Other bytes, another register, or nothing after the register are
+    // not the frame the device expects.
+    test.assert(not dev_bus.wiring_write(bus(), w, 0x20, [0x57 as u8]))
+    test.assert(not dev_bus.wiring_write(bus(), w, 0x21, [0x57 as u8, 0x01 as u8]))
+
+@test
+fn test_wiring_write_to_an_spi_device_is_refused() [io, hw]
+    test.assert(not dev_bus.wiring_write(bus(), dev_bus.wiring_spi(0, 4), 0x20, [0x57 as u8, 0x01 as u8]))
+
+// ── An SPI transaction ───────────────────────────────────────────────
+
+@test
+fn test_spi_exchange_answers_the_bytes_read() [io, hw]
+    let w = dev_bus.wiring_spi(0, 4)
+    let rx = dev_bus.wiring_spi_exchange(FakeSpi { rx: [9, 8, 7], trip: -1 }, FakePins { trip: -1 }, w,
+                                         [0xa8 as u8], 2)
+    test.assert(rx.len() == 2)
+    test.assert((rx[0] as Int) == 9)
+    test.assert((rx[1] as Int) == 8)
+
+// One transaction with a device on chip select 4, through pins that
+// panic on `pin_trip` and a bus that panics on a command of `cmd_trip`.
+fn exchange(pin_trip: Int, cmd_trip: Int) [hw]
+    let _ = dev_bus.wiring_spi_exchange(FakeSpi { rx: [0], trip: cmd_trip }, FakePins { trip: pin_trip },
+                                        dev_bus.wiring_spi(0, 4), [0x9f as u8], 0)
+
+@test
+fn test_spi_exchange_selects_the_device_writes_and_releases_it() [io, hw]
+    // Pin 4 is driven low (40) and then high (41).
+    test.assert_raises(() => exchange(40, -1))
+    test.assert_raises(() => exchange(41, -1))
+    // The command reaches the bus.
+    test.assert_raises(() => exchange(-1, 0x9f))
+    // Nothing else is written.
+    exchange(42, 0x9e)
+
+@test
+fn test_spi_exchange_with_nothing_to_read_answers_nothing() [io, hw]
+    let rx = dev_bus.wiring_spi_exchange(FakeSpi { rx: [1], trip: -1 }, FakePins { trip: -1 },
+                                         dev_bus.wiring_spi(0, 4), [0x06 as u8], 0)
+    test.assert(rx.len() == 0)
+
+@test
+fn test_spi_exchange_without_a_chip_select_drives_nothing() [io, hw]
+    // The pin double would panic on any write to pin 0; none happens.
+    let rx = dev_bus.wiring_spi_exchange(FakeSpi { rx: [1], trip: 0x06 }, FakePins { trip: 0 },
+                                         dev_bus.wiring_i2c(0, 0x18), [0x06 as u8], 1)
+    test.assert(rx.len() == 0)
+
+// ── Sign extension ───────────────────────────────────────────────────
+
+@test
+fn test_sign_extend_reads_the_top_bit_as_the_sign() [io]
+    test.assert(dev_bus.dev_sign_extend(0xfff, 12) == -1)
+    test.assert(dev_bus.dev_sign_extend(0x800, 12) == -2048)
+    test.assert(dev_bus.dev_sign_extend(0x7ff, 12) == 2047)
+    test.assert(dev_bus.dev_sign_extend(0, 12) == 0)
+    // Bits above the width are ignored.
+    test.assert(dev_bus.dev_sign_extend(0xf001, 12) == 1)
+    test.assert(dev_bus.dev_sign_extend(0xff, 8) == -1)
+
+// ── An interrupt line, awaited ───────────────────────────────────────
+
+// A device whose line has already fired: each arm resolves the
+// caller's Future at once with `level`, which is 0 for an event and
+// negative for a fault.
+struct FiredLine
+    level: Int
+
+impl AsyncDeviceReady[] for FiredLine
+    fn ready_arm(self, f: Future) -> Int
+        if core.rt.future_is_ready(f)
+            return -2
+        core.rt.future_set(f, self.level)
+        0
+
+    fn ready_disarm(self) -> Bool
+        false
+
+    fn ready_irqs(self) -> Int
+        0
+
+fn wait_ready<D: AsyncDeviceReady[e]>(d: D, f: Future) -> Int [e, async]
+    core.rt.future_reset(f)
+    if d.ready_arm(f) < 0
+        return -1
+    core.rt.future_await(f)
+
+@test
+fn test_a_ready_line_resolves_the_caller_s_future() [io, async]
+    let f = core.rt.future_new()
+    let d = FiredLine { level: 0 }
+    test.assert(wait_ready(d, f) == 0)
+    test.assert(wait_ready(d, f) == 0)
+    // Without a reset the Future is still resolved: a second arm.
+    test.assert(d.ready_arm(f) == -2)
+    test.assert(not d.ready_disarm())
+    test.assert(d.ready_irqs() == 0)
+    test.assert(wait_ready(FiredLine { level: -5 }, f) == -5)
+    core.rt.future_drop(f)

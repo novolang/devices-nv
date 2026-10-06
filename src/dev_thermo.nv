@@ -1,0 +1,71 @@
+// dev_thermo — a thermometer: a device that measures temperature.
+//
+// A reading here is in thousandths of a degree Celsius (milli-degrees).
+// That is finer than the 1/16 °C, 62.5 milli-degrees, that most parts
+// resolve; a part that resolves 1/128 °C, 7.8125 milli-degrees, loses
+// less than a thousandth of a degree to the integer.
+//
+// A part either converts continuously, so its result register always
+// holds a recent reading, or converts once on request and takes a fixed
+// time to finish, from a few milliseconds to most of a second at its
+// finest resolution.  A reading taken before a conversion finishes
+// answers the previous result, or garbage, and nothing on the bus says
+// which.  For that reason `temp_start` answers the conversion time, the
+// caller waits it however its program waits, and `temp_read_after`
+// refuses a read that comes too early.
+
+use dev_bus.{ dev_sign_extend }
+
+// A temperature in milli-degrees Celsius.
+pub @value
+struct TempMilliC
+    milli_c: Int
+
+// What a program reads from a thermometer.
+//
+// `temp_start` starts a conversion and answers how long it takes, in
+// microseconds: 0 for a part that converts continuously, and a negative
+// value when the device refused.  `temp_read` answers the result of the
+// most recent conversion that finished, or `None` when the device did not
+// answer.
+pub trait Thermometer[e]
+    fn temp_start(self) -> Int [e]
+    fn temp_read(self) -> ?TempMilliC [e]
+
+    // The result of the conversion started last, or `None` when
+    // `waited_us` is shorter than the `conversion_us` that `temp_start`
+    // answered: an early read answers a result that is not the one
+    // asked for.
+    fn temp_read_after(self, waited_us: Int, conversion_us: Int) -> ?TempMilliC [e]
+        if conversion_us < 0 or waited_us < conversion_us
+            return None
+        self.temp_read()
+
+// A thermometer on a host's scheduler: `temp_measure` starts a
+// conversion, parks the task for its length and answers the result.  At
+// `@tier(embedded)` a device implements `dev_bus.AsyncDeviceReady`
+// instead, or the caller waits the time `temp_start` answers.
+pub trait ThermometerAsync[e]
+    async fn temp_measure(self) -> ?TempMilliC [e]
+
+// The temperature a raw count means.
+//
+// `raw` is the result register's count right-justified, and `bits` is
+// how many bits it has.  The count is two's complement and each step is
+// `micro_c_per_lsb` millionths of a degree, the resolution the data sheet
+// gives: 62500 for 1/16 °C, 250000 for 1/4 °C.  The answer is rounded
+// toward zero.
+//
+// ```novo
+// use dev_thermo
+//
+// fn main() [io]
+//     // A 12-bit count of 400 at 1/16 °C per step is 25 °C.
+//     println("${dev_thermo.temp_of_raw(400, 12, 62500).milli_c}")   // 25000
+// ```
+pub fn temp_of_raw(raw: Int, bits: Int, micro_c_per_lsb: Int) -> TempMilliC
+    TempMilliC { milli_c: dev_sign_extend(raw, bits) * micro_c_per_lsb / 1000 }
+
+// The temperature in milli-degrees Fahrenheit, for display.
+pub fn temp_milli_f(t: TempMilliC) -> Int
+    t.milli_c * 9 / 5 + 32000
