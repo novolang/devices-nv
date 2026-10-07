@@ -5,7 +5,7 @@ All notable changes to devices-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## 0.2.0 — unreleased
+## 0.2.0 — 2026-10-07
 
 New kinds of device, the IMU bundles, a part's identification, and
 registers at 16-bit addresses.  Absence in the records is an optional
