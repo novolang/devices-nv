@@ -20,8 +20,11 @@ answers at a seven-bit address. On an **SPI** bus a device is selected
 by a **chip-select** pin, which the controller drives low for the
 length of a transaction. A device may also drive an **interrupt line**,
 a pin it pulses or holds when it has something to report, such as a new
-sample or an alarm. `DeviceWiring` records the bus, the address or the
-chip-select pin, and the interrupt pin a device uses.
+sample or an alarm. `DeviceWiring` records the bus, and as optionals
+the address or the chip-select pin and the interrupt pin: a device on
+I2C has `addr` and `cs` is `None`, one on SPI the reverse, and `irq` is
+`None` when the board wires no interrupt line. The record is a value
+with no allocation, so a driver at the embedded tier holds it.
 
 A **trait** is a named set of method signatures, and a **driver** is a
 type that implements one for a particular part. A program that takes a
@@ -145,7 +148,7 @@ impl Thermometer[hw] for Tmp102
 | Module | What is in it |
 | --- | --- |
 | `dev_bus` | `DeviceWiring` and its constructors; register reads and writes over an I2C bus at one-byte and two-byte register addresses; one SPI transaction inside the chip-select window, with the filler byte a read clocks out; the same through `DevBytes` buffers the caller owns; sign extension of a raw count; the `AsyncDeviceReady` trait for an interrupt line. |
-| `dev_id` | `DeviceId`, the `Identifiable` trait with its probe, and the identification byte read from an I2C or SPI part with no driver. |
+| `dev_id` | `DeviceId`, a part's identification byte and its revision when it reports one, the `Identifiable` trait with its probe, and the identification byte read from an I2C or SPI part with no driver. |
 | `dev_accel` | The accelerometer traits, `AccelMilliG`, `AccelRange`, and the conversion from a raw count to milli-g. |
 | `dev_gyro` | The gyroscope traits, `GyroMilliDps`, `GyroRange`, and the conversion from a raw count at the part's sensitivity. |
 | `dev_mag` | The magnetometer traits, `MagNanoT`, and the conversion from a raw count. |
@@ -153,7 +156,7 @@ impl Thermometer[hw] for Tmp102
 | `dev_thermo` | The thermometer traits, `TempMilliC`, the conversion from a raw count, and Fahrenheit for display. |
 | `dev_hygro` | The hygrometer traits, `MilliPercentRh`, and the conversion from a linear count. |
 | `dev_baro` | The barometer traits, `Pascals`, and the conversion from a linear count. |
-| `dev_power` | The power-manager traits, `MilliVolts`, `MilliAmps`, `RailState`, `ChargeState`, `BatteryReading`, `PowerSource`, and the regulator-step calculation. |
+| `dev_power` | The power-manager traits, `MilliVolts`, `MilliAmps`, `RailState`, `ChargeState`, `BatteryReading` with its optional state of charge, `PowerSource`, and the regulator-step calculation. |
 | `dev_rtc` | The real-time-clock traits, `RtcDateTime`, `AlarmMatch`, BCD conversion, the 12-hour form, leap years, month lengths, validity, the day of the week, an alarm's match and Unix time. |
 
 ## How to choose an entry point

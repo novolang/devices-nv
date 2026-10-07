@@ -8,8 +8,8 @@
 // transaction.  Either way it may also drive an interrupt line, a GPIO
 // pin it pulses or holds when it has something to report: a new
 // sample, a finished conversion, an alarm.  `DeviceWiring` records the
-// three facts, with -1 for the ones a device does not use, and is what
-// a driver is constructed from.
+// three facts, each optional, `None` for the ones a device does not use,
+// and is what a driver is constructed from.
 //
 // The functions over a bus take the bus as a type parameter bounded by
 // embedded-hal-nv's `I2cBus` or `SpiBus`, so a driver written over them
@@ -25,31 +25,35 @@ use embedded_hal.{ I2cBus, SpiBus, GpioOut }
 // declaration numbers it.  It records where the device is and nothing
 // here reads it: a driver is handed the bus itself, and the functions
 // below take that bus as their first argument.  `addr` is the
-// seven-bit I2C address, or -1 on SPI.  `cs` is the chip-select pin on
-// SPI, or -1 on I2C.  `irq` is the pin the device's interrupt line
-// reaches, or -1 when it has none or the board does not wire it.  A pin
+// seven-bit I2C address, `None` on SPI.  `cs` is the chip-select pin on
+// SPI, `None` on I2C.  `irq` is the pin the device's interrupt line
+// reaches, `None` when it has none or the board does not wire it.  A pin
 // is the hardware's own number, as `embedded_hal.GpioOut` takes it.
+//
+// The three optional fields are flat: each is a flag beside its value,
+// inside the record, so a wiring is built, copied and read without an
+// allocation, at the embedded tier as anywhere else.
 pub @value
 struct DeviceWiring
     bus: Int
-    addr: Int
-    cs: Int
-    irq: Int
+    addr: ?Int
+    cs: ?Int
+    irq: ?Int
 
 // A device on I2C bus `bus` at the seven-bit address `addr`, with no
 // interrupt line.
 //
 // ```novo
 // let w = dev_bus.wiring_i2c(0, 0x18)
-// println("${w.addr}")        // 24
+// println("${w.addr ?? -1}")        // 24
 // ```
 pub fn wiring_i2c(bus: Int, addr: Int) -> DeviceWiring
-    DeviceWiring { bus: bus, addr: addr, cs: -1, irq: -1 }
+    DeviceWiring { bus: bus, addr: Some(addr), cs: None, irq: None }
 
 // A device on SPI bus `bus` selected by the pin `cs`, with no interrupt
 // line.
 pub fn wiring_spi(bus: Int, cs: Int) -> DeviceWiring
-    DeviceWiring { bus: bus, addr: -1, cs: cs, irq: -1 }
+    DeviceWiring { bus: bus, addr: None, cs: Some(cs), irq: None }
 
 // The same wiring with the device's interrupt line on pin `irq`.
 //
@@ -58,16 +62,16 @@ pub fn wiring_spi(bus: Int, cs: Int) -> DeviceWiring
 // println("${dev_bus.wiring_has_irq(w)}")   // true
 // ```
 pub fn wiring_irq(w: DeviceWiring, irq: Int) -> DeviceWiring
-    DeviceWiring { bus: w.bus, addr: w.addr, cs: w.cs, irq: irq }
+    DeviceWiring { bus: w.bus, addr: w.addr, cs: w.cs, irq: Some(irq) }
 
 // Whether the device is selected by a chip-select pin, which is to say
 // it sits on SPI.
 pub fn wiring_is_spi(w: DeviceWiring) -> Bool
-    w.cs >= 0
+    w.cs != None
 
 // Whether the board wires the device's interrupt line to a pin.
 pub fn wiring_has_irq(w: DeviceWiring) -> Bool
-    w.irq >= 0
+    w.irq != None
 
 // Reads `n` bytes from the register `reg` of an I2C device, in one
 // transaction: the register address is written, then a repeated start
@@ -84,10 +88,9 @@ pub fn wiring_has_irq(w: DeviceWiring) -> Bool
 // so the frame is built in one here and the caller writes none.  A
 // driver that keeps no list of its own reads through `wiring_read_into`.
 pub fn wiring_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int) -> ?[u8] [hw]
-    if w.addr < 0
-        return None
+    let Some(addr) = w.addr else return None
     system
-        return bus.write_read(w.addr, [reg as u8], n)
+        return bus.write_read(addr, [reg as u8], n)
 
 // Writes `data` to the register `reg` of an I2C device: the register
 // address, then the bytes, in one transaction.  A device that
@@ -103,14 +106,13 @@ pub fn wiring_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int) -> ?[u8
 // the call returns.  `list.push`, which grows a list, is not used: the
 // embedded tier refuses it everywhere.
 pub fn wiring_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, data: [u8]) -> Bool [hw]
-    if w.addr < 0
-        return false
+    let Some(addr) = w.addr else return false
     system
         var frame: [u8] = list.with_capacity(data.len() + 1)
         let _ = list.try_push(frame, reg as u8)
         for b in data
             let _ = list.try_push(frame, b)
-        return bus.write(w.addr, frame)
+        return bus.write(addr, frame)
 
 // Runs one SPI transaction with an SPI device: drives its chip-select
 // pin low, writes `tx`, reads `n` bytes, and drives the pin high again.
@@ -126,17 +128,17 @@ pub fn wiring_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, data: [u8]) ->
 // runs the transaction through `wiring_spi_exchange_into`.
 pub fn wiring_spi_exchange<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, tx: [u8],
                                                   n: Int) -> [u8] [hw]
-    if w.cs < 0
+    let Some(cs) = w.cs else
         system
             return []
-    gpio.set(w.cs, 0)
+    gpio.set(cs, 0)
     bus.write(tx)
     system
         let rx = if n > 0
             bus.read(n)
         else
             []
-        gpio.set(w.cs, 1)
+        gpio.set(cs, 1)
         return rx
 
 // ── Register access through buffers the caller owns ──────────────────
@@ -185,14 +187,13 @@ pub fn wiring_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
 // Answers whether the device acknowledged every byte, and `false` for a
 // wiring that is not on I2C.
 pub fn wiring_write_from<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
-    if w.addr < 0
-        return false
+    let Some(addr) = w.addr else return false
     system
         var frame: [u8] = list.with_capacity(src.len() + 1)
         let _ = list.try_push(frame, reg as u8)
         for b in src
             let _ = list.try_push(frame, b)
-        return bus.write(w.addr, frame)
+        return bus.write(addr, frame)
 
 // Runs one SPI transaction with an SPI device, as `wiring_spi_exchange`
 // does: drives its chip-select pin low, sends the bytes `tx` holds,
@@ -220,14 +221,15 @@ pub fn wiring_spi_exchange_fill_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: 
                                                             tx: DevBytes, n: Int, fill: Int,
                                                             var dst: DevBytes) -> Bool [hw]
     dst.clear()
-    if w.cs < 0 or n > dst.capacity()
+    let Some(cs) = w.cs else return false
+    if n > dst.capacity()
         return false
-    gpio.set(w.cs, 0)
+    gpio.set(cs, 0)
     for b in tx
         let _ = bus.transfer(b as Int)
     for i in 0..n
         let _ = dst.push(bus.transfer(fill & 0xff) as u8)
-    gpio.set(w.cs, 1)
+    gpio.set(cs, 1)
     true
 
 // ── Registers at a 16-bit address ────────────────────────────────────
@@ -257,12 +259,13 @@ fn addr_lo_second(reg: Int, big_endian: Bool) -> Int
 fn read16_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, big_endian: Bool, n: Int,
                           var dst: DevBytes) -> Bool [hw]
     dst.clear()
-    if w.addr < 0 or n > dst.capacity()
+    let Some(addr) = w.addr else return false
+    if n > dst.capacity()
         return false
     var got = false
     system
         let frame = [addr_hi_first(reg, big_endian) as u8, addr_lo_second(reg, big_endian) as u8]
-        match bus.write_read(w.addr, frame, n)
+        match bus.write_read(addr, frame, n)
             Some(b) =>
                 for x in b
                     let _ = dst.push(x)
@@ -274,15 +277,14 @@ fn read16_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, big_endian: Bool, n
 // One write with a two-byte register address before the bytes.
 fn write16_from<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, big_endian: Bool,
                            src: DevBytes) -> Bool [hw]
-    if w.addr < 0
-        return false
+    let Some(addr) = w.addr else return false
     system
         var frame: [u8] = list.with_capacity(src.len() + 2)
         let _ = list.try_push(frame, addr_hi_first(reg, big_endian) as u8)
         let _ = list.try_push(frame, addr_lo_second(reg, big_endian) as u8)
         for b in src
             let _ = list.try_push(frame, b)
-        return bus.write(w.addr, frame)
+        return bus.write(addr, frame)
 
 // Reads `n` bytes from the register at the 16-bit address `reg` of an
 // I2C device into `dst`, in one transaction: the address's high byte,

@@ -80,7 +80,9 @@ fn lis3dh_bus() -> FakeI2c
 @test
 fn test_an_i2c_part_answers_its_identification_byte() [io, hw]
     match dev_id.id_read_i2c(lis3dh_bus(), dev_bus.wiring_i2c(0, 0x18), 0x0f)
-        Some(id) => test.assert(id.who == 0x33)
+        Some(id) =>
+            test.assert(id.who == 0x33)
+            test.assert(id.rev == None)
         None     => test.assert(false)
     test.assert(dev_id.id_read_i2c(lis3dh_bus(), dev_bus.wiring_i2c(0, 0x19), 0x0f) == None)
     test.assert(dev_id.id_read_i2c(lis3dh_bus(), dev_bus.wiring_spi(0, 4), 0x0f) == None)
@@ -90,7 +92,9 @@ fn test_an_spi_part_answers_its_identification_byte() [io, hw]
     // The command 0x8F reads register 0x0F.
     let w = dev_bus.wiring_spi(0, 4)
     match dev_id.id_read_spi(FakeSpi { rx: 0x33, trip: -1 }, FakePins { trip: -1 }, w, 0x8f)
-        Some(id) => test.assert(id.who == 0x33)
+        Some(id) =>
+            test.assert(id.who == 0x33)
+            test.assert(id.rev == None)
         None     => test.assert(false)
     test.assert_raises(() => read_spi(0x8f))
     test.assert(dev_id.id_read_spi(FakeSpi { rx: 0x33, trip: -1 }, FakePins { trip: 0 },
@@ -119,15 +123,17 @@ fn test_a_bring_up_scan_finds_the_part() [io, hw]
 // ── Through the trait ────────────────────────────────────────────────
 
 // A part that answered `who` when it was recorded, performing nothing;
-// a negative `who` is a part that did not answer.
+// a negative `who` is a part that did not answer.  A part that reports
+// a revision answers it as `rev`.
 struct Recorded
     who: Int
+    rev: ?Int
 
 impl Identifiable[] for Recorded
     fn device_id(self) -> ?DeviceId
         if self.who < 0
             return None
-        Some(DeviceId { who: self.who })
+        Some(DeviceId { who: self.who, rev: self.rev })
 
 // The number of the parts that answer as expected, generic over the
 // part and its effect.
@@ -140,6 +146,20 @@ fn present<D: Identifiable[e]>(d: D, expect: Int) -> Int [e]
 @satisfies(REQ-DEV-013)
 @test
 fn test_a_probe_compares_the_identification_byte()
-    test.assert(present(Recorded { who: 0x60 }, 0x60) == 1)
-    test.assert(present(Recorded { who: 0x58 }, 0x60) == 0)
-    test.assert(present(Recorded { who: -1 }, 0x60) == 0)
+    test.assert(present(Recorded { who: 0x60, rev: None }, 0x60) == 1)
+    test.assert(present(Recorded { who: 0x58, rev: None }, 0x60) == 0)
+    test.assert(present(Recorded { who: -1, rev: None }, 0x60) == 0)
+
+@test
+fn test_a_part_that_reports_a_revision_answers_it()
+    match Recorded { who: 0x6c, rev: Some(2) }.device_id()
+        Some(id) =>
+            test.assert(id.who == 0x6c)
+            test.assert(id.rev == Some(2))
+            test.assert((id.rev ?? 0) == 2)
+        None     => test.assert(false)
+    match Recorded { who: 0x6c, rev: None }.device_id()
+        Some(id) => test.assert(id.rev == None)
+        None     => test.assert(false)
+    // A probe compares the identification byte alone.
+    test.assert(present(Recorded { who: 0x6c, rev: Some(3) }, 0x6c) == 1)

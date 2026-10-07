@@ -161,9 +161,9 @@ impl PowerManager[hw] for Pmic
                     return None
                 let ma = dev_bus.dev_sign_extend((b[2] as Int << 8) | b[3] as Int, 16)
                 let pct = if (b[5] as Int) == 0xff
-                    -1
+                    None
                 else
-                    b[5] as Int
+                    Some(b[5] as Int)
                 Some(BatteryReading { voltage: MilliVolts { mv: mv }, current: MilliAmps { ma: ma },
                                       charge: phase_of_code(b[4] as Int), percent: pct })
             None    => None
@@ -262,7 +262,8 @@ fn test_a_battery_measurement() [io, hw]
             test.assert(b.voltage.mv == 3700)
             test.assert(b.current.ma == 120)
             test.assert(b.charge == ChargeConstantCurrent)
-            test.assert(b.percent == 64)
+            test.assert(b.percent == Some(64))
+            test.assert((b.percent ?? 0) == 64)
             test.assert(dev_power.power_is_charging(b.charge))
         None    => test.assert(false)
 
@@ -277,7 +278,7 @@ fn test_a_discharging_battery_without_a_fuel_gauge() [io, hw]
     match pmic(r, []).battery()
         Some(b) =>
             test.assert(b.current.ma == -250)
-            test.assert(b.percent == -1)
+            test.assert(b.percent == None)
             test.assert(not dev_power.power_is_charging(b.charge))
         None    => test.assert(false)
 

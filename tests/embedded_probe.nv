@@ -83,6 +83,11 @@ fn score() -> Int [hw]
     let flash = dev_bus.wiring_irq(dev_bus.wiring_spi(0, 4), 5)
     if dev_bus.wiring_spi_exchange_into(BoardSpi { id: 0 }, BoardGpio { id: 0 }, flash, tx, 3, rx)
         n = n + rx.len()
+    // The wiring's optional fields, each a flag beside its pin or
+    // address inside the record: the flash's chip select 4 and interrupt
+    // pin 5, the thermometer's address 0x48, and the flash's absent
+    // address.
+    n = n + (flash.cs ?? 0) + (flash.irq ?? 0) + (t.w.addr ?? 0) + (flash.addr ?? 1000)
 
     // dev_accel: a full-scale range and a count in milli-g.
     match dev_accel.accel_range_for(3000)
@@ -126,7 +131,7 @@ fn score() -> Int [hw]
             n = n + 512
     match dev_id.id_read_spi(BoardSpi { id: 0 }, BoardGpio { id: 0 }, flash, 0x9f)
         Some(id) =>
-            n = n + id.who
+            n = n + id.who + (id.rev ?? 7)
         None     =>
             n = n + 1024
 

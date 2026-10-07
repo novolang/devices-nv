@@ -15,10 +15,14 @@
 use dev_bus.{ DeviceWiring, DevBytes }
 use embedded_hal.{ I2cBus, SpiBus, GpioOut }
 
-// What a part says it is: `who` is its identification byte.
+// What a part says it is: `who` is its identification byte, and `rev`
+// its revision, for a part that reports one in a register of its own,
+// and `None` for a part that does not.  Two parts that answer the same
+// `who` and differ in a register map are told apart by `rev`.
 pub @value
 struct DeviceId
     who: Int
+    rev: ?Int
 
 // A part that reports its identity.
 //
@@ -37,8 +41,9 @@ pub trait Identifiable[e]
             None     => false
 
 // The identification byte at register `reg` of an I2C part, read in one
-// transaction.  `None` when the part did not answer, and for a wiring
-// that is not on I2C.
+// transaction, as a `DeviceId` whose `rev` is `None`: where a part keeps
+// its revision is its own, and its driver reads it.  `None` when the
+// part did not answer, and for a wiring that is not on I2C.
 //
 // ```novo norun:fragment
 // use embedded_hal.{ BoardI2c }
@@ -52,12 +57,13 @@ pub fn id_read_i2c<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?DeviceId [h
     var b: DevBytes = Vec.new()
     if not dev_bus.wiring_read_into(bus, w, reg, 1, b)
         return None
-    Some(DeviceId { who: b[0] as Int })
+    Some(DeviceId { who: b[0] as Int, rev: None })
 
 // The identification byte of an SPI part, read in one transaction that
 // sends the command byte `cmd` and reads one byte back.  The command is
 // the part's own: many sensors read register r with the command
-// 0x80 | r.  `None` for a wiring with no chip-select pin.
+// 0x80 | r.  The answer's `rev` is `None`, as `id_read_i2c`'s is.
+// `None` for a wiring with no chip-select pin.
 pub fn id_read_spi<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring,
                                           cmd: Int) -> ?DeviceId [hw]
     var tx: DevBytes = Vec.new()
@@ -65,4 +71,4 @@ pub fn id_read_spi<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring,
     var rx: DevBytes = Vec.new()
     if not dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 1, rx)
         return None
-    Some(DeviceId { who: rx[0] as Int })
+    Some(DeviceId { who: rx[0] as Int, rev: None })

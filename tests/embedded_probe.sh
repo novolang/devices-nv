@@ -37,13 +37,15 @@ EOF
 # The score the image reports under QEMU.  No I2C device answers there,
 # and the SPI bus reads 0xFF for every byte, so the terms are: the
 # refused thermometer read 2, sign extension 4, the three-byte SPI read
-# 3, the accelerometer count 3998, the regulator step 1800, the charger
-# 32, the weekday and BCD 62, the day after by Unix time 8, the alarm
-# 256, the refused I2C identification 512, the SPI identification 255,
-# the SPI read with a 0x00 filler 1, the gyroscope 8, the magnetometer
-# 100, the hygrometer 50, the barometer 101, the gyroscope's range 500
-# and the paired sample 3.
-SCORE=7695
+# 3, the wiring's optional fields 1081 (the chip select 4, the interrupt
+# pin 5, the address 72 and 1000 for the absent address), the
+# accelerometer count 3998, the regulator step 1800, the charger 32, the
+# weekday and BCD 62, the day after by Unix time 8, the alarm 256, the
+# refused I2C identification 512, the SPI identification 255 and 7 for
+# its absent revision, the SPI read with a 0x00 filler 1, the gyroscope
+# 8, the magnetometer 100, the hygrometer 50, the barometer 101, the
+# gyroscope's range 500 and the paired sample 3.
+SCORE=8783
 
 fail=0
 for target in nrf52-qemu frdm-mcxn947; do

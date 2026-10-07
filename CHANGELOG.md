@@ -8,7 +8,27 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 ## 0.2.0 — unreleased
 
 New kinds of device, the IMU bundles, a part's identification, and
-registers at 16-bit addresses.
+registers at 16-bit addresses.  Absence in the records is an optional
+rather than -1, which takes novo-lang 0.19.1, the first release whose
+`@value` structs hold an optional field.
+
+### Breaking changes and migrations
+
+- **`DeviceWiring.addr`, `cs` and `irq` are `?Int`.**  A device on I2C
+  has `addr: Some(a)` and `cs: None`, one on SPI `addr: None` and
+  `cs: Some(pin)`, and `irq` is `None` when the board wires no
+  interrupt line, where 0.1.x wrote -1 for each.  `wiring_i2c`,
+  `wiring_spi` and `wiring_irq` keep their signatures and build the new
+  shape.  *Migration:* read a field with `match`, `if let`, `let … else`
+  or `??` where it was compared with -1: `w.addr ?? -1` gives 0.1.x's
+  value, `let Some(addr) = w.addr else return None` takes the address or
+  leaves, and `wiring_is_spi(w)` and `wiring_has_irq(w)` still answer
+  the two questions.  A record literal writes `Some(n)` and `None`.
+- **`BatteryReading.percent` is `?Int`.**  It is `None` for a part with
+  no fuel gauge, where 0.1.x answered -1.  *Migration:* a driver for a
+  part without a gauge writes `percent: None`, one with a gauge
+  `percent: Some(p)`; a reader writes `b.percent ?? -1` for 0.1.x's
+  value, or matches.
 
 ### Added
 
@@ -31,9 +51,11 @@ registers at 16-bit addresses.
   same contract (`baro_start`, `baro_read_after`); the reading
   `Pascals`; `baro_of_raw`.  No altitude: it needs the local sea-level
   pressure.
-- **`dev_id`**: `DeviceId`, the `Identifiable` trait with its default
-  `device_probe`, and `id_read_i2c` and `id_read_spi`, which read a
-  part's identification byte with no driver.
+- **`dev_id`**: `DeviceId`, a part's identification byte `who` and
+  its revision `rev`, `None` for a part that reports none; the
+  `Identifiable` trait with its default `device_probe`, which compares
+  `who` alone; and `id_read_i2c` and `id_read_spi`, which read a part's
+  identification byte with no driver and leave `rev` `None`.
 - **`dev_bus`**: `wiring_read16_into`, `wiring_write16_from` and their
   low-byte-first twins `wiring_read16le_into` and
   `wiring_write16le_from`, for registers at 16-bit addresses, each one
