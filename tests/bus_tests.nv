@@ -4,7 +4,7 @@
 use std.test
 use core.rt
 use embedded_hal.{ I2cBus, SpiBus, GpioOut }
-use dev_bus.{ DeviceWiring, AsyncDeviceReady }
+use dev_bus.{ DeviceWiring, DevBytes, AsyncDeviceReady }
 
 // ── Doubles ──────────────────────────────────────────────────────────
 //
@@ -51,8 +51,9 @@ impl I2cBus for FakeI2c
             list.push(out, self.regs[r + i] as u8)
         Some(out)
 
-// An SPI bus whose reads answer `rx`, from its first byte.  A write
-// whose first byte is `trip` panics.
+// An SPI bus whose reads answer `rx`, from its first byte, and whose
+// one-byte exchanges answer `rx`'s first byte.  A write whose first
+// byte is `trip`, and an exchange of the byte `trip`, panic.
 struct FakeSpi
     rx: [Int]
     trip: Int
@@ -62,6 +63,8 @@ impl SpiBus for FakeSpi
         pass
 
     fn transfer(self, b: Int) -> Int [hw]
+        if b == self.trip
+            panic.panic("spi transfer")
         self.rx[0]
 
     fn write(self, data: [u8]) [hw]
@@ -190,6 +193,94 @@ fn test_spi_exchange_without_a_chip_select_drives_nothing() [io, hw]
     let rx = dev_bus.wiring_spi_exchange(FakeSpi { rx: [1], trip: 0x06 }, FakePins { trip: 0 },
                                          dev_bus.wiring_i2c(0, 0x18), [0x06 as u8], 1)
     test.assert(rx.len() == 0)
+
+// ── Register access through the caller's buffers ─────────────────────
+
+// A buffer holding `a` and `b`.
+fn two(a: Int, b: Int) -> DevBytes
+    var v: DevBytes = Vec.new()
+    let _ = v.push(a as u8)
+    let _ = v.push(b as u8)
+    v
+
+@test
+fn test_a_buffer_holds_32_bytes() [io]
+    var v: DevBytes = Vec.new()
+    test.assert(v.capacity() == 32)
+    for i in 0..32
+        let _ = v.push(i as u8)
+    test.assert(v.is_full())
+
+@test
+fn test_wiring_read_into_fills_the_buffer_in_one_transaction() [io, hw]
+    var dst = two(9, 9)
+    test.assert(dev_bus.wiring_read_into(bus(), dev_bus.wiring_i2c(0, 0x18), 1, 3, dst))
+    test.assert(dst.len() == 3)
+    test.assert((dst[0] as Int) == 0x33)
+    test.assert((dst[2] as Int) == 0x55)
+
+@test
+fn test_wiring_read_into_of_an_absent_device_empties_the_buffer() [io, hw]
+    var dst = two(9, 9)
+    test.assert(not dev_bus.wiring_read_into(bus(), dev_bus.wiring_i2c(0, 0x19), 1, 1, dst))
+    test.assert(dst.is_empty())
+    test.assert(not dev_bus.wiring_read_into(bus(), dev_bus.wiring_spi(0, 4), 1, 1, dst))
+
+@test
+fn test_wiring_read_into_refuses_more_than_the_buffer_holds() [io, hw]
+    var dst = two(9, 9)
+    test.assert(not dev_bus.wiring_read_into(bus(), dev_bus.wiring_i2c(0, 0x18), 0, 33, dst))
+    test.assert(dst.is_empty())
+
+@test
+fn test_wiring_write_from_sends_the_register_then_the_buffer() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x18)
+    test.assert(dev_bus.wiring_write_from(bus(), w, 0x20, two(0x57, 0x01)))
+    test.assert(not dev_bus.wiring_write_from(bus(), w, 0x20, two(0x57, 0x02)))
+    test.assert(not dev_bus.wiring_write_from(bus(), w, 0x21, two(0x57, 0x01)))
+
+@test
+fn test_wiring_write_from_to_an_spi_device_is_refused() [io, hw]
+    test.assert(not dev_bus.wiring_write_from(bus(), dev_bus.wiring_spi(0, 4), 0x20, two(0x57, 0x01)))
+
+@test
+fn test_spi_exchange_into_fills_the_buffer() [io, hw]
+    var dst = two(1, 1)
+    test.assert(dev_bus.wiring_spi_exchange_into(FakeSpi { rx: [7], trip: -1 }, FakePins { trip: -1 },
+                                                 dev_bus.wiring_spi(0, 4), two(0xa8, 0), 3, dst))
+    test.assert(dst.len() == 3)
+    test.assert((dst[0] as Int) == 7)
+    test.assert((dst[2] as Int) == 7)
+
+// One buffered transaction with a device on chip select 4, through pins
+// that panic on `pin_trip` and a bus that panics on exchanging
+// `byte_trip`.
+fn exchange_into(pin_trip: Int, byte_trip: Int, n: Int) [hw]
+    var dst: DevBytes = Vec.new()
+    let _ = dev_bus.wiring_spi_exchange_into(FakeSpi { rx: [0], trip: byte_trip },
+                                             FakePins { trip: pin_trip }, dev_bus.wiring_spi(0, 4),
+                                             two(0x9f, 0x10), n, dst)
+
+@test
+fn test_spi_exchange_into_selects_sends_reads_and_releases() [io, hw]
+    test.assert_raises(() => exchange_into(40, -1, 1))
+    test.assert_raises(() => exchange_into(41, -1, 1))
+    // Both bytes of the command reach the bus.
+    test.assert_raises(() => exchange_into(-1, 0x9f, 0))
+    test.assert_raises(() => exchange_into(-1, 0x10, 0))
+    // A byte read clocks out 0xFF, and with nothing to read none is.
+    test.assert_raises(() => exchange_into(-1, 0xff, 1))
+    exchange_into(-1, 0xff, 0)
+
+@test
+fn test_spi_exchange_into_refuses_without_a_chip_select_or_room() [io, hw]
+    var dst = two(1, 1)
+    // The pin double would panic on any write to pin 0; none happens.
+    test.assert(not dev_bus.wiring_spi_exchange_into(FakeSpi { rx: [1], trip: 0x9f }, FakePins { trip: 0 },
+                                                     dev_bus.wiring_i2c(0, 0x18), two(0x9f, 0), 1, dst))
+    test.assert(dst.is_empty())
+    test.assert(not dev_bus.wiring_spi_exchange_into(FakeSpi { rx: [1], trip: 0x9f }, FakePins { trip: 40 },
+                                                     dev_bus.wiring_spi(0, 4), two(0x9f, 0), 33, dst))
 
 // ── Sign extension ───────────────────────────────────────────────────
 

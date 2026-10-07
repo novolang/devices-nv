@@ -1,0 +1,110 @@
+// embedded_probe.nv — this package's device claim, as a firmware image
+// that either builds for a Cortex-M or does not.
+//
+// It is not a test suite.  `tests/embedded_probe.sh` builds it with
+//
+//   novo build --target=nrf52-qemu tests/embedded_probe.nv
+//   novo build --target=frdm-mcxn947 tests/embedded_probe.nv
+//
+// and each build produces a Cortex-M ELF or fails.  The tier check holds
+// every function of every module a device build includes at
+// `@tier(embedded)`, whether or not the firmware calls it, so a build
+// that links is the claim that all five modules check clean there: the
+// probe names each of them.
+//
+// The driver below is laid out as a real part is, a TI TMP102
+// thermometer at 0x48 on the board's first I2C bus, and keeps its bytes
+// in a `DevBytes` of its own, so it builds no list and needs no
+// `system` block.  The second half runs an SPI transaction the same
+// way.  On a board with no device at either place the reads answer
+// `false` or `None`, and the image still reports and parks.
+
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_power.{ MilliVolts, ChargeState }
+use dev_rtc.{ RtcDateTime }
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio }
+
+// A TMP102 on the board's I2C bus.  Its temperature register, 0, holds
+// a 12-bit count of 62.5 milli-degrees, left-justified in two bytes.
+@value
+struct Tmp102
+    bus: BoardI2c
+    w: DeviceWiring
+
+impl Thermometer[hw] for Tmp102
+    // The part converts continuously.  Writing its configuration
+    // register checks it is there; -1 when it does not acknowledge.
+    fn temp_start(self) -> Int [hw]
+        var cfg: DevBytes = Vec.new()
+        let _ = cfg.push(0x60 as u8)
+        let _ = cfg.push(0xa0 as u8)
+        if dev_bus.wiring_write_from(self.bus, self.w, 1, cfg)
+            return 0
+        -1
+
+    fn temp_read(self) -> ?TempMilliC [hw]
+        var b: DevBytes = Vec.new()
+        if not dev_bus.wiring_read_into(self.bus, self.w, 0, 2, b)
+            return None
+        let raw = (b[0] as Int << 4) | (b[1] as Int >> 4)
+        Some(dev_thermo.temp_of_raw(raw, 12, 62500))
+
+// Every answer the probe computes, folded into one number, so the image
+// depends on all of them and none is folded away as unused.
+@tier(embedded)
+fn score() -> Int [hw]
+    var n = 0
+
+    // dev_bus: the wiring, sign extension, and the buffer forms.  The
+    // program owns the buses and starts them; a driver only uses them.
+    BoardI2c { id: 0 }.init(100000)
+    BoardSpi { id: 0 }.init(1000000, 0)
+    let t = Tmp102 { bus: BoardI2c { id: 0 }, w: dev_bus.wiring_i2c(0, 0x48) }
+    if t.temp_start() == 0
+        n = n + 1
+    match t.temp_read()
+        Some(c) =>
+            n = n + dev_thermo.temp_milli_f(c)
+        None    =>
+            n = n + 2
+    if dev_bus.dev_sign_extend(0xfff, 12) == -1
+        n = n + 4
+
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push(0x9f as u8)
+    var rx: DevBytes = Vec.new()
+    let flash = dev_bus.wiring_irq(dev_bus.wiring_spi(0, 4), 5)
+    if dev_bus.wiring_spi_exchange_into(BoardSpi { id: 0 }, BoardGpio { id: 0 }, flash, tx, 3, rx)
+        n = n + rx.len()
+
+    // dev_accel: a full-scale range and a count in milli-g.
+    match dev_accel.accel_range_for(3000)
+        Some(r) =>
+            n = n + dev_accel.accel_milli_g(0x7ff, 12, r)
+        None    =>
+            n = n + 8
+
+    // dev_power: a regulator step and a charger state.
+    match dev_power.power_step(MilliVolts { mv: 1830 }, 1000, 3300, 50)
+        Some(v) =>
+            n = n + v.mv
+        None    =>
+            n = n + 16
+    if dev_power.power_is_charging(ChargeState.ChargeConstantCurrent)
+        n = n + 32
+
+    // dev_rtc: BCD, validity and the day of the week.
+    let d = RtcDateTime { year: 2026, month: 10, day: 7, hour: 12, minute: 0, second: 0 }
+    if dev_rtc.rtc_is_valid(d)
+        n = n + dev_rtc.rtc_weekday(d) + dev_rtc.rtc_from_bcd(0x59)
+    n
+
+fn main() [hw]
+    let n = score()
+    // Two writes rather than an interpolation, which the tier refuses.
+    hal.uart.write("devices-nv: score ")
+    hal.uart.write(str.from_int(n))
+    hal.uart.write("\n")
+    loop
+        pass

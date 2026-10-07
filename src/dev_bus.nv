@@ -74,10 +74,17 @@ pub fn wiring_has_irq(w: DeviceWiring) -> Bool
 //
 // Answers `None` when the device did not acknowledge, and for a wiring
 // that is not on I2C.
+//
+// The answer is a list, the bus's own, and the register address goes
+// out as a one-byte list, because `I2cBus.write_read` takes and answers
+// lists.  The embedded tier builds a list only inside a `system` block,
+// so the frame is built in one here and the caller writes none.  A
+// driver that keeps no list of its own reads through `wiring_read_into`.
 pub fn wiring_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int) -> ?[u8] [hw]
     if w.addr < 0
         return None
-    bus.write_read(w.addr, [reg as u8], n)
+    system
+        return bus.write_read(w.addr, [reg as u8], n)
 
 // Writes `data` to the register `reg` of an I2C device: the register
 // address, then the bytes, in one transaction.  A device that
@@ -86,13 +93,21 @@ pub fn wiring_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int) -> ?[u8
 //
 // Answers whether the device acknowledged every byte, and `false` for a
 // wiring that is not on I2C.
+//
+// The frame is one list of exactly the register and the bytes, built in
+// a `system` block with `list.with_capacity` and `list.try_push`, so on
+// a microcontroller it is one allocation of a known size, released when
+// the call returns.  `list.push`, which grows a list, is not used: the
+// embedded tier refuses it everywhere.
 pub fn wiring_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, data: [u8]) -> Bool [hw]
     if w.addr < 0
         return false
-    var frame: [u8] = [reg as u8]
-    for b in data
-        list.push(frame, b)
-    bus.write(w.addr, frame)
+    system
+        var frame: [u8] = list.with_capacity(data.len() + 1)
+        let _ = list.try_push(frame, reg as u8)
+        for b in data
+            let _ = list.try_push(frame, b)
+        return bus.write(w.addr, frame)
 
 // Runs one SPI transaction with an SPI device: drives its chip-select
 // pin low, writes `tx`, reads `n` bytes, and drives the pin high again.
@@ -102,18 +117,100 @@ pub fn wiring_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, data: [u8]) ->
 // device's own: many sensors set the top bit of a register address to
 // read it and the next bit to auto-increment.  A wiring with no
 // chip-select pin answers the empty list and drives no pin.
+//
+// The empty answers are lists built in a `system` block, the one place
+// the embedded tier builds one.  A driver that keeps no list of its own
+// runs the transaction through `wiring_spi_exchange_into`.
 pub fn wiring_spi_exchange<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, tx: [u8],
                                                   n: Int) -> [u8] [hw]
     if w.cs < 0
-        return []
+        system
+            return []
     gpio.set(w.cs, 0)
     bus.write(tx)
-    let rx = if n > 0
-        bus.read(n)
-    else
-        []
+    system
+        let rx = if n > 0
+            bus.read(n)
+        else
+            []
+        gpio.set(w.cs, 1)
+        return rx
+
+// ── Register access through buffers the caller owns ──────────────────
+//
+// A driver on a microcontroller keeps its bytes in a `DevBytes`, a
+// `Vec[u8; 32]` held in its own frame, and moves them through the
+// functions below, so its own code builds no list and needs no `system`
+// block.  32 bytes holds every register transfer of the kinds this
+// package names: a sample of three axes is 6 bytes, a clock's time and
+// alarms 19.  A transfer longer than the buffer is refused rather than
+// cut short.
+//
+// ```novo
+// var buf: DevBytes = Vec.new()
+// let _ = buf.push(0x57 as u8)
+// println("${buf.len()} of ${buf.capacity()}")   // 1 of 32
+// ```
+pub alias DevBytes = Vec[u8; 32]
+
+// Reads `n` bytes from the register `reg` of an I2C device into `dst`,
+// in one transaction, as `wiring_read` does.  `dst` is emptied first
+// and then holds the bytes read.
+//
+// Answers whether the device answered.  A wiring that is not on I2C,
+// and an `n` larger than `dst` holds, answer `false` without a
+// transaction.  The bus answers the bytes as a list, which this
+// function releases before it returns.
+pub fn wiring_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                   var dst: DevBytes) -> Bool [hw]
+    dst.clear()
+    if n > dst.capacity()
+        return false
+    match wiring_read(bus, w, reg, n)
+        Some(b) =>
+            for x in b
+                let _ = dst.push(x)
+            true
+        None    => false
+
+// Writes the bytes `src` holds to the register `reg` of an I2C device,
+// in one transaction, as `wiring_write` does.
+//
+// Answers whether the device acknowledged every byte, and `false` for a
+// wiring that is not on I2C.
+pub fn wiring_write_from<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
+    if w.addr < 0
+        return false
+    system
+        var frame: [u8] = list.with_capacity(src.len() + 1)
+        let _ = list.try_push(frame, reg as u8)
+        for b in src
+            let _ = list.try_push(frame, b)
+        return bus.write(w.addr, frame)
+
+// Runs one SPI transaction with an SPI device, as `wiring_spi_exchange`
+// does: drives its chip-select pin low, sends the bytes `tx` holds,
+// reads `n` bytes into `dst`, and drives the pin high again.  `dst` is
+// emptied first.
+//
+// Every byte goes through `SpiBus.transfer`, one exchange per byte, and
+// a byte read clocks out 0xFF as `SpiBus.read` does, so the transaction
+// builds no list at all.  Answers `true` when it ran; a wiring with no
+// chip-select pin, and an `n` larger than `dst` holds, answer `false`
+// and drive no pin.
+pub fn wiring_spi_exchange_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring,
+                                                       tx: DevBytes, n: Int,
+                                                       var dst: DevBytes) -> Bool [hw]
+    dst.clear()
+    if w.cs < 0 or n > dst.capacity()
+        return false
+    gpio.set(w.cs, 0)
+    for b in tx
+        let _ = bus.transfer(b as Int)
+    for i in 0..n
+        let _ = dst.push(bus.transfer(0xff) as u8)
     gpio.set(w.cs, 1)
-    rx
+    true
 
 // The signed value of the low `bits` bits of `raw`, read as two's
 // complement.  A sensor reports a signed reading in a register narrower

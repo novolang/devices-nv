@@ -104,7 +104,7 @@ fn main() [io]
 
 | Module | What is in it |
 | --- | --- |
-| `dev_bus` | `DeviceWiring` and its constructors; register reads and writes over an I2C bus; one SPI transaction inside the chip-select window; sign extension of a raw count; the `AsyncDeviceReady` trait for an interrupt line. |
+| `dev_bus` | `DeviceWiring` and its constructors; register reads and writes over an I2C bus; one SPI transaction inside the chip-select window; the same three through `DevBytes` buffers the caller owns; sign extension of a raw count; the `AsyncDeviceReady` trait for an interrupt line. |
 | `dev_accel` | The accelerometer traits, `AccelMilliG`, `AccelRange`, and the conversion from a raw count to milli-g. |
 | `dev_thermo` | The thermometer traits, `TempMilliC`, the conversion from a raw count, and Fahrenheit for display. |
 | `dev_power` | The power-manager traits, `MilliVolts`, `MilliAmps`, `RailState`, `ChargeState`, `BatteryReading`, and the regulator-step calculation. |
@@ -152,10 +152,50 @@ fn main() [io]
 The sync traits and `AsyncDeviceReady` are written for a
 microcontroller with no heap: every reading is a value type carried in
 the caller's frame, and an optional reading is a flag beside it, so
-answering one allocates nothing. The functions of `dev_bus` that move
-bytes take and return lists, which a program at `@tier(embedded)`
-builds only into storage it owns. The async traits are for a host's
+answering one allocates nothing. The async traits are for a host's
 scheduler.
+
+A driver moves a device's bytes with the functions of `dev_bus`, which
+come in two forms:
+
+- `wiring_read`, `wiring_write` and `wiring_spi_exchange` take and
+  return lists. On a microcontroller a list is built only inside a
+  `system` block, and these build theirs there, each of a known size,
+  so a driver may call them; a driver that writes a list of its own
+  needs a `system` block for it.
+- `wiring_read_into`, `wiring_write_from` and
+  `wiring_spi_exchange_into` move the bytes through a `DevBytes`, a
+  buffer of up to 32 bytes the driver keeps in its own frame, so the
+  driver builds no list. The SPI transaction builds none at all. The
+  I2C pair hands the bus a list, because embedded-hal-nv's `I2cBus`
+  takes and answers lists, and releases it before returning.
+
+```novo norun:fragment
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_thermo.{ TempMilliC, Thermometer }
+use embedded_hal.{ BoardI2c }
+
+// A TI TMP102 thermometer: register 0 holds a 12-bit count of
+// 62.5 milli-degrees, left-justified in two bytes.
+@value
+struct Tmp102
+    bus: BoardI2c
+    w: DeviceWiring
+
+impl Thermometer[hw] for Tmp102
+    fn temp_start(self) -> Int [hw]
+        0
+
+    fn temp_read(self) -> ?TempMilliC [hw]
+        var b: DevBytes = Vec.new()
+        if not dev_bus.wiring_read_into(self.bus, self.w, 0, 2, b)
+            return None
+        let raw = ((b[0] as Int) << 4) | ((b[1] as Int) >> 4)
+        Some(dev_thermo.temp_of_raw(raw, 12, 62500))
+```
+
+`tests/embedded_probe.sh` builds every module, with a driver of this
+shape, for `--target=nrf52-qemu` and `--target=frdm-mcxn947`.
 
 ## What is not included
 
@@ -191,12 +231,14 @@ TI TMP102 thermometer, an Analog Devices DS3231 clock and an Adesto
 AT45DB flash, and the suites assert what each register read and write
 carries. A second implementation of each trait performs nothing and
 supplies no effect. `tests/coverage.sh` merges the suites' line
-coverage over `src/`.
+coverage over `src/`, and `tests/embedded_probe.sh` builds the package for
+two microcontroller boards.
 
 ```
 novo pkg build
 novo test tests
 bash tests/coverage.sh
+bash tests/embedded_probe.sh
 ```
 
 ## Licence

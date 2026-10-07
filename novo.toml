@@ -1,6 +1,6 @@
 [package]
 name        = "devices-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "The traits a program reads a board's peripheral chips through: an accelerometer, a thermometer, a power manager and a real-time clock, each as a sync trait and an async one, with readings in milli-g, milli-degrees, millivolts and milliamps, and calendar time as types.  Drivers implement them over embedded-hal-nv's I2C and SPI buses and the pins a board gives; block storage is embedded-hal-nv's own trait."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -9,11 +9,13 @@ layer       = "host"
 tags        = ["embedded", "drivers", "accelerometer", "thermometer", "pmic", "rtc", "i2c", "spi", "sensor", "traits"]
 repository  = "https://github.com/novolang/devices-nv"
 maintainers = ["novo-lang"]
-# 0.18.4 is the first release that admits `==` on a payload-free
+# 0.19.0 is the first release that admits `==` on a payload-free
 # @value enum inside a trait's default method, which `rail_is_on` is,
 # and the first in which a README example's `AccelRange.AccelRange2g`,
 # with the enum brought in by `use dev_accel.{ AccelRange }`, compiles.
-novo        = ">= 0.18.4"
+# 0.1.0 named 0.18.4 for these, a version that was never released; the
+# fixes shipped in 0.19.0.
+novo        = ">= 0.19.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
