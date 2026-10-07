@@ -21,7 +21,10 @@ use embedded_hal.{ I2cBus, SpiBus, GpioOut }
 
 // Where a device sits on the board.
 //
-// `bus` is the instance of the bus, 0 for the first.  `addr` is the
+// `bus` is the instance of the bus, 0 for the first, as the board's
+// declaration numbers it.  It records where the device is and nothing
+// here reads it: a driver is handed the bus itself, and the functions
+// below take that bus as their first argument.  `addr` is the
 // seven-bit I2C address, or -1 on SPI.  `cs` is the chip-select pin on
 // SPI, or -1 on I2C.  `irq` is the pin the device's interrupt line
 // reaches, or -1 when it has none or the board does not wire it.  A pin
@@ -142,9 +145,12 @@ pub fn wiring_spi_exchange<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiri
 // `Vec[u8; 32]` held in its own frame, and moves them through the
 // functions below, so its own code builds no list and needs no `system`
 // block.  32 bytes holds every register transfer of the kinds this
-// package names: a sample of three axes is 6 bytes, a clock's time and
-// alarms 19.  A transfer longer than the buffer is refused rather than
-// cut short.
+// package names: a sample of three axes is 6 bytes, a gyroscope and
+// accelerometer read together 12, a clock's time and alarms 19, and a
+// humidity and pressure sensor's calibration block 26.  A part with a
+// larger block, a FIFO drained in one burst for instance, is read in
+// pieces of at most 32 bytes.  A transfer longer than the buffer is
+// refused rather than cut short.
 //
 // ```novo
 // var buf: DevBytes = Vec.new()
@@ -193,14 +199,26 @@ pub fn wiring_write_from<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevB
 // reads `n` bytes into `dst`, and drives the pin high again.  `dst` is
 // emptied first.
 //
-// Every byte goes through `SpiBus.transfer`, one exchange per byte, and
-// a byte read clocks out 0xFF as `SpiBus.read` does, so the transaction
-// builds no list at all.  Answers `true` when it ran; a wiring with no
-// chip-select pin, and an `n` larger than `dst` holds, answer `false`
-// and drive no pin.
+// Every byte goes through `SpiBus.transfer`, one exchange per byte, so
+// the transaction builds no list at all.  A byte read clocks out 0xFF,
+// the byte `SpiBus.read` clocks out; a part that needs another filler
+// byte is read through `wiring_spi_exchange_fill_into`.  Answers `true`
+// when it ran; a wiring with no chip-select pin, and an `n` larger than
+// `dst` holds, answer `false` and drive no pin.
 pub fn wiring_spi_exchange_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring,
                                                        tx: DevBytes, n: Int,
                                                        var dst: DevBytes) -> Bool [hw]
+    wiring_spi_exchange_fill_into(bus, gpio, w, tx, n, 0xff, dst)
+
+// The SPI transaction of `wiring_spi_exchange_into`, clocking out
+// `fill` for each byte read.  A device shifts its answer out while the
+// controller shifts the filler in, and most parts ignore the filler, so
+// 0xFF is the default.  Some parts read a filler of 0xFF as the start
+// of a command and need 0x00 instead; their data sheets say so.  Only
+// the low eight bits of `fill` are sent.
+pub fn wiring_spi_exchange_fill_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring,
+                                                            tx: DevBytes, n: Int, fill: Int,
+                                                            var dst: DevBytes) -> Bool [hw]
     dst.clear()
     if w.cs < 0 or n > dst.capacity()
         return false
@@ -208,9 +226,92 @@ pub fn wiring_spi_exchange_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: Devic
     for b in tx
         let _ = bus.transfer(b as Int)
     for i in 0..n
-        let _ = dst.push(bus.transfer(0xff) as u8)
+        let _ = dst.push(bus.transfer(fill & 0xff) as u8)
     gpio.set(w.cs, 1)
     true
+
+// ── Registers at a 16-bit address ────────────────────────────────────
+//
+// Most sensors number their registers in one byte.  Some parts, a
+// time-of-flight sensor or an EEPROM larger than 256 bytes for
+// instance, number them in two, and a transaction sends both address
+// bytes before the data.  The functions below send the high byte
+// first, the order most data sheets give; the `le` forms send the low
+// byte first.  Each is one transaction in the combined format, as
+// `wiring_read` is.
+
+// The address bytes of a 16-bit register, in the order they go out.
+fn addr_hi_first(reg: Int, big_endian: Bool) -> Int
+    if big_endian
+        (reg >> 8) & 0xff
+    else
+        reg & 0xff
+
+fn addr_lo_second(reg: Int, big_endian: Bool) -> Int
+    if big_endian
+        reg & 0xff
+    else
+        (reg >> 8) & 0xff
+
+// One read in the combined format with a two-byte register address.
+fn read16_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, big_endian: Bool, n: Int,
+                          var dst: DevBytes) -> Bool [hw]
+    dst.clear()
+    if w.addr < 0 or n > dst.capacity()
+        return false
+    var got = false
+    system
+        let frame = [addr_hi_first(reg, big_endian) as u8, addr_lo_second(reg, big_endian) as u8]
+        match bus.write_read(w.addr, frame, n)
+            Some(b) =>
+                for x in b
+                    let _ = dst.push(x)
+                got = true
+            None    =>
+                got = false
+    got
+
+// One write with a two-byte register address before the bytes.
+fn write16_from<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, big_endian: Bool,
+                           src: DevBytes) -> Bool [hw]
+    if w.addr < 0
+        return false
+    system
+        var frame: [u8] = list.with_capacity(src.len() + 2)
+        let _ = list.try_push(frame, addr_hi_first(reg, big_endian) as u8)
+        let _ = list.try_push(frame, addr_lo_second(reg, big_endian) as u8)
+        for b in src
+            let _ = list.try_push(frame, b)
+        return bus.write(w.addr, frame)
+
+// Reads `n` bytes from the register at the 16-bit address `reg` of an
+// I2C device into `dst`, in one transaction: the address's high byte,
+// its low byte, then a repeated start and the read.  `dst` is emptied
+// first.  Answers whether the device answered; a wiring that is not on
+// I2C, and an `n` larger than `dst` holds, answer `false` without a
+// transaction.
+pub fn wiring_read16_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                     var dst: DevBytes) -> Bool [hw]
+    read16_into(bus, w, reg, true, n, dst)
+
+// `wiring_read16_into` for a part that takes the address's low byte
+// first.
+pub fn wiring_read16le_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                       var dst: DevBytes) -> Bool [hw]
+    read16_into(bus, w, reg, false, n, dst)
+
+// Writes the bytes `src` holds to the register at the 16-bit address
+// `reg` of an I2C device, in one transaction: the address's high byte,
+// its low byte, then the bytes.  Answers whether the device acknowledged
+// every byte, and `false` for a wiring that is not on I2C.
+pub fn wiring_write16_from<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
+    write16_from(bus, w, reg, true, src)
+
+// `wiring_write16_from` for a part that takes the address's low byte
+// first.
+pub fn wiring_write16le_from<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int,
+                                        src: DevBytes) -> Bool [hw]
+    write16_from(bus, w, reg, false, src)
 
 // The signed value of the low `bits` bits of `raw`, read as two's
 // complement.  A sensor reports a signed reading in a register narrower

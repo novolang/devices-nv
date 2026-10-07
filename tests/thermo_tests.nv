@@ -129,6 +129,7 @@ fn at(hi: Int, lo: Int) -> OneShot
 fn test_start_answers_the_conversion_time() [io, hw]
     test.assert(at(0, 0).temp_start() == 35000)
 
+@satisfies(REQ-DEV-003)
 @test
 fn test_a_refused_start_answers_a_negative_time() [io, hw]
     let p = OneShot { bus: FakeI2c { addr: 0x48, regs: [0, 0], expect: [] },
@@ -149,6 +150,7 @@ fn test_a_reading_is_in_milli_degrees() [io, hw]
         Some(t) => test.assert(t.milli_c == -10062)
         None    => test.assert(false)
 
+@satisfies(REQ-DEV-003)
 @test
 fn test_an_early_read_is_refused() [io, hw]
     let p = at(0x19, 0x00)
@@ -158,12 +160,14 @@ fn test_an_early_read_is_refused() [io, hw]
         Some(t) => test.assert(t.milli_c == 25000)
         None    => test.assert(false)
 
+@satisfies(REQ-DEV-001)
 @test
 fn test_an_absent_part_answers_nothing() [io, hw]
     let p = OneShot { bus: FakeI2c { addr: 0x49, regs: [0, 0], expect: [] },
         w: dev_bus.wiring_i2c(0, 0x48) }
     test.assert(p.temp_read() == None)
 
+@satisfies(REQ-DEV-008)
 @test
 fn test_the_async_form_measures_once() [io, hw, async]
     match await at(0x19, 0x00).temp_measure()

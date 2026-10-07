@@ -1,0 +1,67 @@
+// dev_hygro — a hygrometer: a device that measures relative humidity.
+//
+// Relative humidity is the water vapour in the air as a share of the
+// most the air could hold at its temperature, from 0 to 100 percent.
+// A reading here is in thousandths of a percent of relative humidity
+// (milli-percent RH), so 45.5 % reads 45500.
+//
+// Humidity sensors convert as thermometers do: either continuously, or
+// once on request, taking a fixed time to finish.  The contract is the
+// thermometer's: `rh_start` answers the conversion time, the caller
+// waits it however its program waits, and `rh_read_after` refuses a read
+// that comes too early.  A humidity sensor usually measures temperature
+// too, because relative humidity depends on it, and its driver may
+// implement `dev_thermo.Thermometer` beside `Hygrometer`.
+
+// A relative humidity in thousandths of a percent.
+pub @value
+struct MilliPercentRh
+    milli_pct: Int
+
+// What a program reads from a hygrometer.
+//
+// `rh_start` starts a conversion and answers how long it takes, in
+// microseconds: 0 for a part that converts continuously, and a negative
+// value when the device refused.  `rh_read` answers the result of the
+// most recent conversion that finished, or `None` when the device did
+// not answer.
+pub trait Hygrometer[e]
+    fn rh_start(self) -> Int [e]
+    fn rh_read(self) -> ?MilliPercentRh [e]
+
+    // The result of the conversion started last, or `None` when
+    // `waited_us` is shorter than the `conversion_us` that `rh_start`
+    // answered: an early read answers a result that is not the one asked
+    // for.
+    fn rh_read_after(self, waited_us: Int, conversion_us: Int) -> ?MilliPercentRh [e]
+        if conversion_us < 0 or waited_us < conversion_us
+            return None
+        self.rh_read()
+
+// A hygrometer on a host's scheduler: `rh_measure` starts a conversion,
+// parks the task for its length and answers the result.  At
+// `@tier(embedded)` a device implements `dev_bus.AsyncDeviceReady`
+// instead, or the caller waits the time `rh_start` answers.
+pub trait HygrometerAsync[e]
+    async fn rh_measure(self) -> ?MilliPercentRh [e]
+
+// The relative humidity a raw count means, for a part whose count is
+// linear in humidity from 0 % at a count of 0 to 100 % at `span`.
+//
+// The span is the part's own: 65535 for a part that divides by
+// 2^16 - 1, 65536 for one that divides by 2^16.  A count beyond the span
+// reads 100 %, and the answer is rounded toward zero.  A part whose
+// count needs calibration constants, as Bosch's do, computes the
+// humidity with its data sheet's formula instead.
+//
+// ```novo
+// fn main() [io]
+//     // Half the span is 50 %.
+//     println("${dev_hygro.rh_of_raw(32768, 65536).milli_pct}")   // 50000
+// ```
+pub fn rh_of_raw(raw: Int, span: Int) -> MilliPercentRh
+    if span <= 0 or raw <= 0
+        return MilliPercentRh { milli_pct: 0 }
+    if raw >= span
+        return MilliPercentRh { milli_pct: 100000 }
+    MilliPercentRh { milli_pct: raw * 100000 / span }

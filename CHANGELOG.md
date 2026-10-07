@@ -5,6 +5,70 @@ All notable changes to devices-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.2.0 — unreleased
+
+New kinds of device, the IMU bundles, a part's identification, and
+registers at 16-bit addresses.
+
+### Added
+
+- **`dev_gyro`**: the `Gyroscope` and `GyroscopeAsync` traits, the
+  reading `GyroMilliDps` in milli-degrees per second per axis, the range
+  `GyroRange` from ±250 to ±2000 dps, `gyro_full_scale`,
+  `gyro_range_for`, and `gyro_milli_dps` from a count at the part's
+  sensitivity.
+- **`dev_mag`**: the `Magnetometer` and `MagnetometerAsync` traits, the
+  reading `MagNanoT` in nanotesla per axis, and `mag_nano_t`.
+- **`dev_imu`**: `ImuSample`, `ImuSample9`, and the `Imu` and `Imu9`
+  traits that answer an IMU's kinds latched at one instant and read in
+  one transaction; `imu_six_of_nine`.  The bundles do not name the kinds
+  as supertraits, because a supertrait cannot carry an effect argument;
+  a driver implements the kinds beside them.
+- **`dev_hygro`**: the `Hygrometer` and `HygrometerAsync` traits, with
+  the thermometer's conversion-time contract (`rh_start`,
+  `rh_read_after`); the reading `MilliPercentRh`; `rh_of_raw`.
+- **`dev_baro`**: the `Barometer` and `BarometerAsync` traits, with the
+  same contract (`baro_start`, `baro_read_after`); the reading
+  `Pascals`; `baro_of_raw`.  No altitude: it needs the local sea-level
+  pressure.
+- **`dev_id`**: `DeviceId`, the `Identifiable` trait with its default
+  `device_probe`, and `id_read_i2c` and `id_read_spi`, which read a
+  part's identification byte with no driver.
+- **`dev_bus`**: `wiring_read16_into`, `wiring_write16_from` and their
+  low-byte-first twins `wiring_read16le_into` and
+  `wiring_write16le_from`, for registers at 16-bit addresses, each one
+  transaction in the combined format; `wiring_spi_exchange_fill_into`,
+  whose reads clock out a filler byte the driver chooses, for a part
+  that needs 0x00.  `wiring_spi_exchange_into` keeps 0xFF.  `DevBytes`
+  stays 32 bytes: every transfer the kinds name fits, the largest a
+  humidity and pressure sensor's 26-byte calibration block, and a FIFO
+  is drained a sample at a time.
+- **`Accelerometer`**: `accel_set_rate_hz`, answering the rate the part
+  took; `accel_fifo_count` and `accel_fifo_read` into a
+  `Vec[AccelMilliG; 32]`.  Each has a body for a part without the
+  feature, so an existing driver builds unchanged.
+- **`RealTimeClock`**: `AlarmMatch` and `rtc_set_alarm_match`, whose
+  body passes the once form to `rtc_set_alarm` and refuses the
+  repeating forms; `rtc_alarm_matches`, `rtc_to_unix` and
+  `rtc_from_unix`.
+- **`PowerManager`**: `PowerSource` and `power_source`, and
+  `rail_current`, each with a body for a part that cannot tell.
+- **`devices.req.nv`**: the README's rules as requirements, each
+  checked by the tests that carry its `@satisfies`.
+- Test drivers laid out as an ST LSM6DSO with its FIFO, an ST LIS3MDL
+  and a Bosch BME280, the last checked against its data sheet's worked
+  example; `tests/embedded_probe.sh` also runs the image under QEMU and
+  checks its score.
+
+### Changed
+
+- The README's first example names `face_up`, the function it shows,
+  and the TMP102 driver stands beside it as the shape a real driver
+  takes.  The rules gain the async traits' contract: an async trait
+  only waits, and configuration goes through the sync trait.
+- `DeviceWiring.bus` is documented as the board file's index, which no
+  function here reads.
+
 ## 0.1.1 — 2026-10-07
 
 The package builds for a device.

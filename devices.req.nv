@@ -1,0 +1,84 @@
+// devices.req.nv — the rules of README.md § The rules a user needs, as
+// requirements.  Each rule's number in the README is the last part of its
+// identifier, and the tests that check a rule carry `@satisfies` with
+// it.  `novo req check` reads this file; it is not a Novo program.
+
+functional REQ-DEV-001 "A reading is an optional"
+  priority: high
+  description: "None means the device did not answer on the bus, never a reading of zero"
+  acceptance: "A driver whose part does not acknowledge answers None from every read"
+  tags: readings
+
+functional REQ-DEV-002 "A new sample is read only once"
+  priority: high
+  description: "The read forms answer the latest sample; the read_new forms answer only a sample completed since the last read"
+  acceptance: "accel_read_new, gyro_read_new and mag_read_new answer None while the data-ready flag is clear"
+  tags: readings
+
+functional REQ-DEV-003 "An early read of a conversion is refused"
+  priority: high
+  description: "temp_start, rh_start and baro_start answer the conversion time in microseconds, and the read_after forms refuse a read before it has passed"
+  acceptance: "A read after less than the conversion time answers None; a refused start refuses the read"
+  tags: conversions
+
+functional REQ-DEV-004 "A rail is never set above its request"
+  priority: critical
+  description: "rail_set_voltage sets the nearest step at or below the request and answers it"
+  acceptance: "power_step answers the highest step at or below the request, and None below the range"
+  tags: power
+
+functional REQ-DEV-005 "A time read after the oscillator stopped is refused"
+  priority: high
+  description: "rtc_now_valid answers None when the oscillator stopped since the clock was last set"
+  tags: clock
+
+functional REQ-DEV-006 "Calendar time is 24-hour Gregorian with no zone"
+  priority: medium
+  description: "RtcDateTime is the 24-hour form of the proleptic Gregorian calendar; weekdays number as ISO 8601; Unix time has no leap seconds"
+  acceptance: "rtc_weekday answers 1 for Monday to 7 for Sunday"
+  acceptance: "rtc_to_unix and rtc_from_unix agree with Unix time and invert each other"
+  tags: clock
+
+functional REQ-DEV-007 "An I2C register read is one transaction"
+  priority: high
+  description: "The register address, one byte or two, and a repeated start, in the combined format of UM10204"
+  acceptance: "A read sends the address and reads in one write_read call, high address byte first unless the le form is used"
+  tags: bus
+
+functional REQ-DEV-008 "An async trait only waits"
+  priority: medium
+  description: "An async trait has one wait method; configuration goes through the sync trait a driver implements beside it"
+  acceptance: "Each async trait's one method answers the next sample, conversion or alarm of a driver that also implements the sync trait"
+  tags: async
+
+functional REQ-DEV-009 "A rate setter answers the rate the part took"
+  priority: medium
+  description: "accel_set_rate_hz sets the slowest rate at or above the request, the fastest beyond it, and answers it"
+  acceptance: "A part with a fixed rate answers its rate unchanged"
+  tags: readings
+
+functional REQ-DEV-010 "An alarm fires on the fields its match selects"
+  priority: medium
+  description: "AlarmMatch selects the fields an alarm compares; rtc_set_alarm is the once form"
+  acceptance: "An alarm every day at 07:00:00 fires on any date at seven; a clock that cannot repeat refuses the repeating forms"
+  tags: clock
+
+functional REQ-DEV-011 "A buffer transfer longer than 32 bytes is refused"
+  priority: high
+  description: "A transfer through a DevBytes is refused rather than cut short"
+  tags: bus
+
+functional REQ-DEV-012 "An SPI read clocks out its filler byte"
+  priority: medium
+  description: "0xFF unless the driver passes another; only its low eight bits are sent"
+  tags: bus
+
+functional REQ-DEV-013 "A probe refuses a silent part and a wrong one"
+  priority: medium
+  description: "device_probe answers false for a part that does not answer and for one that answers another identification byte"
+  tags: identity
+
+functional REQ-DEV-014 "An IMU's paired sample is one transaction"
+  priority: medium
+  description: "imu_read and imu9_read answer the kinds latched at one instant"
+  tags: imu

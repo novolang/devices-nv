@@ -58,6 +58,16 @@ struct BatteryReading
     charge: ChargeState
     percent: Int
 
+// Where a board draws its power from.  `PowerNone` is a part that sees
+// no input, which a program running from a backup supply may read.
+// `PowerUnknown` is a part that cannot tell.
+pub @value
+enum PowerSource
+    PowerNone
+    PowerBattery
+    PowerUsb
+    PowerUnknown
+
 // What a program reads from and sets on a power manager.
 //
 // `rail_count` answers how many rails the part has; rails are numbered
@@ -80,6 +90,17 @@ pub trait PowerManager[e]
     // Whether the rail is on and has not faulted.
     fn rail_is_on(self, rail: Int) -> Bool [e]
         self.rail_state(rail) == RailOn
+
+    // The input the board draws its power from.  A part that cannot
+    // tell answers `PowerUnknown`, which is what this body does.
+    fn power_source(self) -> PowerSource [e]
+        PowerUnknown
+
+    // The current a rail supplies, or `None` for a rail the part does
+    // not have and for a part that does not measure its rails' current,
+    // which is what this body answers.
+    fn rail_current(self, rail: Int) -> ?MilliAmps [e]
+        None
 
 // A power manager on a host's scheduler: `battery_measure` starts a
 // measurement of the battery, parks the task until the part's converter

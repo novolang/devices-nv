@@ -1,11 +1,11 @@
 // rtc_tests — the real-time-clock trait implemented by a driver over
-// the I2C double and by a fixed clock that performs nothing; BCD, the
-// 12-hour form, the calendar and the weekday.
+// the I2C double and by a fixed clock that performs nothing; an alarm's
+// match; BCD, the 12-hour form, the calendar, the weekday and Unix time.
 
 use std.test
 use embedded_hal.{ I2cBus, SpiBus, GpioOut }
 use dev_bus.{ DeviceWiring }
-use dev_rtc.{ RtcDateTime, RealTimeClock, RealTimeClockAsync }
+use dev_rtc.{ RtcDateTime, AlarmMatch, RealTimeClock, RealTimeClockAsync }
 
 // ── Doubles ──────────────────────────────────────────────────────────
 //
@@ -97,8 +97,13 @@ impl GpioOut for FakePins
 // from 0x00, the seconds, minutes, hours, weekday, date, month and
 // year.  Bit 6 of the hours selects the 12-hour form, with bit 5 the PM
 // bit; bit 7 of the month is the century.  Bit 7 of STATUS (0x0f) is
-// the oscillator-stop flag.  Alarm 1 is four registers from 0x07, and
-// writing 0 to CONTROL (0x0e) disarms it.
+// the oscillator-stop flag.  Alarm 1 is four registers from 0x07, the
+// second, minute, hour and date, and writing 0 to CONTROL (0x0e)
+// disarms it.  Bit 7 of each alarm register, A1M1 to A1M4, masks its
+// field out of the match: all four set fire each second, A1M1 clear
+// alone matches the second, A1M1 and A1M2 clear the minute and the
+// second, A1M4 set alone the hour, minute and second, and all clear the
+// date as well.
 
 struct Ds
     bus: FakeI2c
@@ -152,6 +157,22 @@ impl RealTimeClock[hw] for Ds
 
     fn rtc_cancel_alarm(self) -> Bool [hw]
         dev_bus.wiring_write(self.bus, self.w, 0x0e, [0 as u8])
+
+    fn rtc_set_alarm_match(self, t: RtcDateTime, m: AlarmMatch) -> Bool [hw]
+        if not dev_rtc.rtc_is_valid(t)
+            return false
+        // The mask bits A1M1 to A1M4, one per register.
+        let masks = match m
+            AlarmOnce        => [0, 0, 0, 0]
+            AlarmEveryDay    => [0, 0, 0, 0x80]
+            AlarmEveryHour   => [0, 0, 0x80, 0x80]
+            AlarmEveryMinute => [0, 0x80, 0x80, 0x80]
+            AlarmEverySecond => [0x80, 0x80, 0x80, 0x80]
+        dev_bus.wiring_write(self.bus, self.w, 0x07,
+                             [(dev_rtc.rtc_to_bcd(t.second) | masks[0]) as u8,
+                              (dev_rtc.rtc_to_bcd(t.minute) | masks[1]) as u8,
+                              (dev_rtc.rtc_to_bcd(t.hour) | masks[2]) as u8,
+                              (dev_rtc.rtc_to_bcd(t.day) | masks[3]) as u8])
 
 impl RealTimeClockAsync[hw] for Ds
     async fn rtc_alarm_wait(self) -> ?RtcDateTime [hw]
@@ -221,6 +242,7 @@ fn test_set_refuses_a_time_the_calendar_or_the_part_does_not_have() [io, hw]
     test.assert(not c.rtc_set(when(1999, 1, 1, 0, 0, 0)))
     test.assert(not c.rtc_set(when(2200, 1, 1, 0, 0, 0)))
 
+@satisfies(REQ-DEV-005)
 @test
 fn test_a_stopped_oscillator_makes_the_time_invalid() [io, hw]
     test.assert(clock(regs(false), []).rtc_running())
@@ -231,6 +253,7 @@ fn test_a_stopped_oscillator_makes_the_time_invalid() [io, hw]
     // The registers still hold a time; it is the time that is wrong.
     test.assert(stopped.rtc_now() != None)
 
+@satisfies(REQ-DEV-001)
 @test
 fn test_an_absent_clock_answers_nothing() [io, hw]
     let gone = Ds { bus: FakeI2c { addr: 0x69, regs: regs(false), expect: [] },
@@ -245,6 +268,18 @@ fn test_the_alarm_is_armed_and_disarmed() [io, hw]
     test.assert(not clock(regs(false), [0x07, 0x00, 0x00, 0x07, 0x07]).rtc_set_alarm(when(2026, 13, 1, 0, 0, 0)))
     test.assert(clock(regs(false), [0x0e, 0x00]).rtc_cancel_alarm())
 
+@satisfies(REQ-DEV-010)
+@test
+fn test_an_alarm_every_day_at_seven_masks_the_date() [io, hw]
+    let t = when(2026, 10, 7, 7, 0, 0)
+    test.assert(clock(regs(false), [0x07, 0x00, 0x00, 0x07, 0x87]).rtc_set_alarm_match(t, AlarmEveryDay))
+    test.assert(clock(regs(false), [0x07, 0x00, 0x00, 0x07, 0x07]).rtc_set_alarm_match(t, AlarmOnce))
+    test.assert(clock(regs(false), [0x07, 0x00, 0x00, 0x87, 0x87]).rtc_set_alarm_match(t, AlarmEveryHour))
+    test.assert(clock(regs(false), [0x07, 0x00, 0x80, 0x87, 0x87]).rtc_set_alarm_match(t, AlarmEveryMinute))
+    test.assert(clock(regs(false), [0x07, 0x80, 0x80, 0x87, 0x87]).rtc_set_alarm_match(t, AlarmEverySecond))
+    test.assert(not clock(regs(false), []).rtc_set_alarm_match(when(2026, 2, 30, 7, 0, 0), AlarmEveryDay))
+
+@satisfies(REQ-DEV-008)
 @test
 fn test_the_async_form_answers_when_the_alarm_fires() [io, hw, async]
     match await clock(regs(false), []).rtc_alarm_wait()
@@ -285,6 +320,64 @@ fn test_a_fixed_clock_needs_no_hardware()
     test.assert(not Fixed { hour: 12 }.rtc_set(when(2030, 1, 1, 0, 0, 0)))
     test.assert(not Fixed { hour: 12 }.rtc_set_alarm(when(2030, 1, 1, 0, 0, 0)))
     test.assert(not Fixed { hour: 12 }.rtc_cancel_alarm())
+
+// A clock whose alarm fires once and cannot repeat: the trait's body
+// passes the once form to `rtc_set_alarm` and refuses the others.
+struct OneShot
+    takes: Bool
+
+impl RealTimeClock[] for OneShot
+    fn rtc_now(self) -> ?RtcDateTime
+        None
+
+    fn rtc_set(self, t: RtcDateTime) -> Bool
+        false
+
+    fn rtc_running(self) -> Bool
+        false
+
+    fn rtc_set_alarm(self, t: RtcDateTime) -> Bool
+        self.takes
+
+    fn rtc_cancel_alarm(self) -> Bool
+        true
+
+@satisfies(REQ-DEV-010)
+@test
+fn test_a_clock_that_cannot_repeat_refuses_a_repeating_alarm()
+    let t = when(2030, 1, 1, 7, 0, 0)
+    test.assert(OneShot { takes: true }.rtc_set_alarm_match(t, AlarmOnce))
+    test.assert(not OneShot { takes: false }.rtc_set_alarm_match(t, AlarmOnce))
+    test.assert(not OneShot { takes: true }.rtc_set_alarm_match(t, AlarmEveryDay))
+    test.assert(not OneShot { takes: true }.rtc_set_alarm_match(t, AlarmEverySecond))
+    test.assert(OneShot { takes: true }.rtc_now_valid() == None)
+
+// ── An alarm's match ─────────────────────────────────────────────────
+
+@satisfies(REQ-DEV-010)
+@test
+fn test_each_match_compares_its_fields() [io]
+    let a = when(2026, 10, 7, 7, 30, 15)
+    // The same time matches every form.
+    test.assert(dev_rtc.rtc_alarm_matches(a, a, AlarmOnce))
+    test.assert(dev_rtc.rtc_alarm_matches(a, a, AlarmEveryDay))
+    // Another day at the same time: every form but once.
+    let next_day = when(2026, 10, 8, 7, 30, 15)
+    test.assert(not dev_rtc.rtc_alarm_matches(next_day, a, AlarmOnce))
+    test.assert(dev_rtc.rtc_alarm_matches(next_day, a, AlarmEveryDay))
+    test.assert(not dev_rtc.rtc_alarm_matches(when(2026, 11, 7, 7, 30, 15), a, AlarmOnce))
+    test.assert(not dev_rtc.rtc_alarm_matches(when(2027, 10, 7, 7, 30, 15), a, AlarmOnce))
+    // Another hour: the hourly form and the finer ones.
+    let other_hour = when(2026, 10, 7, 9, 30, 15)
+    test.assert(not dev_rtc.rtc_alarm_matches(other_hour, a, AlarmEveryDay))
+    test.assert(dev_rtc.rtc_alarm_matches(other_hour, a, AlarmEveryHour))
+    // Another minute: the minute form and each second.
+    let other_minute = when(2026, 10, 7, 9, 31, 15)
+    test.assert(not dev_rtc.rtc_alarm_matches(other_minute, a, AlarmEveryHour))
+    test.assert(dev_rtc.rtc_alarm_matches(other_minute, a, AlarmEveryMinute))
+    let other_second = when(2026, 10, 7, 9, 31, 16)
+    test.assert(not dev_rtc.rtc_alarm_matches(other_second, a, AlarmEveryMinute))
+    test.assert(dev_rtc.rtc_alarm_matches(other_second, a, AlarmEverySecond))
 
 // ── BCD, the 12-hour form, the calendar and the weekday ──────────────
 
@@ -334,6 +427,7 @@ fn test_validity_of_each_field() [io]
     test.assert(not dev_rtc.rtc_is_valid(when(2026, 1, 1, 0, 0, 60)))
     test.assert(not dev_rtc.rtc_is_valid(when(2026, 1, 1, -1, 0, 0)))
 
+@satisfies(REQ-DEV-006)
 @test
 fn test_the_weekday_of_known_dates() [io]
     // 2026-10-06 is a Tuesday, 2000-01-01 a Saturday, 2024-02-29 a
@@ -346,3 +440,57 @@ fn test_the_weekday_of_known_dates() [io]
     let expected = [4, 7, 7, 3, 5, 1, 3, 6, 2, 4, 7, 2]
     for m in 1..13
         test.assert(dev_rtc.rtc_weekday(when(2026, m, 1, 0, 0, 0)) == expected[m - 1])
+
+// ── Unix time ────────────────────────────────────────────────────────
+
+@satisfies(REQ-DEV-006)
+@test
+fn test_unix_time_of_known_instants() [io]
+    test.assert(dev_rtc.rtc_to_unix(when(1970, 1, 1, 0, 0, 0)) == Some(0))
+    test.assert(dev_rtc.rtc_to_unix(when(2000, 1, 1, 0, 0, 0)) == Some(946684800))
+    test.assert(dev_rtc.rtc_to_unix(when(2024, 2, 29, 12, 0, 0)) == Some(1709208000))
+    test.assert(dev_rtc.rtc_to_unix(when(2038, 1, 19, 3, 14, 8)) == Some(2147483648))
+    test.assert(dev_rtc.rtc_to_unix(when(2100, 3, 1, 0, 0, 0)) == Some(4107542400))
+    test.assert(dev_rtc.rtc_to_unix(when(1969, 12, 31, 23, 59, 59)) == None)
+    test.assert(dev_rtc.rtc_to_unix(when(2026, 2, 29, 0, 0, 0)) == None)
+
+@satisfies(REQ-DEV-006)
+@test
+fn test_a_date_from_unix_time() [io]
+    match dev_rtc.rtc_from_unix(1709208000)
+        Some(t) =>
+            test.assert(t.year == 2024)
+            test.assert(t.month == 2)
+            test.assert(t.day == 29)
+            test.assert(t.hour == 12)
+            test.assert(t.minute == 0)
+        None    => test.assert(false)
+    match dev_rtc.rtc_from_unix(2147483647)
+        Some(t) =>
+            test.assert(t.year == 2038)
+            test.assert(t.month == 1)
+            test.assert(t.day == 19)
+            test.assert(t.hour == 3)
+            test.assert(t.minute == 14)
+            test.assert(t.second == 7)
+        None    => test.assert(false)
+    test.assert(dev_rtc.rtc_from_unix(-1) == None)
+
+@satisfies(REQ-DEV-006)
+@test
+fn test_unix_time_round_trips() [io]
+    // The first second of every month of a leap year and a common one,
+    // and the last second of each year end.
+    for y in [2024, 2026, 2100]
+        for m in 1..13
+            let t = when(y, m, 1, 0, 0, 0)
+            match dev_rtc.rtc_to_unix(t)
+                Some(u) =>
+                    match dev_rtc.rtc_from_unix(u)
+                        Some(b) =>
+                            test.assert(b.year == y and b.month == m and b.day == 1)
+                            match dev_rtc.rtc_from_unix(u - 1)
+                                Some(p) => test.assert(p.second == 59 and p.minute == 59 and p.hour == 23)
+                                None    => test.assert(false)
+                        None    => test.assert(false)
+                None    => test.assert(false)

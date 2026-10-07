@@ -1,0 +1,67 @@
+// dev_baro — a barometer: a device that measures air pressure.
+//
+// Air pressure at sea level is about 101 325 pascals (Pa), and falls by
+// about 12 Pa for each metre of height near the ground.  A reading here
+// is in pascals.  Data sheets also use the hectopascal (hPa), 100 Pa,
+// which is the millibar of weather reports.
+//
+// A pressure sensor converts as a thermometer does: either
+// continuously, or once on request, taking a fixed time to finish.  The
+// contract is the thermometer's: `baro_start` answers the conversion
+// time, the caller waits it however its program waits, and
+// `baro_read_after` refuses a read that comes too early.
+//
+// The package gives no altitude.  Altitude from pressure needs the
+// pressure at sea level where the board is, which changes with the
+// weather, so it is a formula for the application that knows it.
+
+use dev_bus.{ dev_sign_extend }
+
+// An air pressure in pascals.
+pub @value
+struct Pascals
+    pa: Int
+
+// What a program reads from a barometer.
+//
+// `baro_start` starts a conversion and answers how long it takes, in
+// microseconds: 0 for a part that converts continuously, and a negative
+// value when the device refused.  `baro_read` answers the result of the
+// most recent conversion that finished, or `None` when the device did
+// not answer.
+pub trait Barometer[e]
+    fn baro_start(self) -> Int [e]
+    fn baro_read(self) -> ?Pascals [e]
+
+    // The result of the conversion started last, or `None` when
+    // `waited_us` is shorter than the `conversion_us` that `baro_start`
+    // answered.
+    fn baro_read_after(self, waited_us: Int, conversion_us: Int) -> ?Pascals [e]
+        if conversion_us < 0 or waited_us < conversion_us
+            return None
+        self.baro_read()
+
+// A barometer on a host's scheduler: `baro_measure` starts a conversion,
+// parks the task for its length and answers the result.  At
+// `@tier(embedded)` a device implements `dev_bus.AsyncDeviceReady`
+// instead, or the caller waits the time `baro_start` answers.
+pub trait BarometerAsync[e]
+    async fn baro_measure(self) -> ?Pascals [e]
+
+// The pressure a raw count means, for a part whose count is linear in
+// pressure.
+//
+// `raw` is the count right-justified, and `bits` is how many bits it
+// has; the count is two's complement.  `lsb_per_hpa` is the part's
+// sensitivity in steps per hectopascal: 4096 for ST's 24-bit parts.  The
+// answer is rounded toward zero.  A part whose count needs calibration
+// constants, as Bosch's do, computes the pressure with its data sheet's
+// formula instead.
+//
+// ```novo
+// fn main() [io]
+//     // 1013.25 hPa at 4096 steps per hPa is a count of 4150272.
+//     println("${dev_baro.baro_of_raw(4150272, 24, 4096).pa}")   // 101325
+// ```
+pub fn baro_of_raw(raw: Int, bits: Int, lsb_per_hpa: Int) -> Pascals
+    Pascals { pa: dev_sign_extend(raw, bits) * 100 / lsb_per_hpa }

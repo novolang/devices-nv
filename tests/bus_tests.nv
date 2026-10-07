@@ -124,6 +124,7 @@ fn test_an_interrupt_line_keeps_the_rest_of_the_wiring() [io]
 fn bus() -> FakeI2c
     FakeI2c { addr: 0x18, regs: [0, 0x33, 0x44, 0x55], expect: [0x20, 0x57, 0x01] }
 
+@satisfies(REQ-DEV-007)
 @test
 fn test_wiring_read_reads_consecutive_registers_in_one_transaction() [io, hw]
     match dev_bus.wiring_read(bus(), dev_bus.wiring_i2c(0, 0x18), 1, 3)
@@ -133,6 +134,7 @@ fn test_wiring_read_reads_consecutive_registers_in_one_transaction() [io, hw]
             test.assert((b[2] as Int) == 0x55)
         None    => test.assert(false)
 
+@satisfies(REQ-DEV-001)
 @test
 fn test_wiring_read_of_an_absent_device_is_none() [io, hw]
     test.assert(dev_bus.wiring_read(bus(), dev_bus.wiring_i2c(0, 0x19), 1, 1) == None)
@@ -211,6 +213,7 @@ fn test_a_buffer_holds_32_bytes() [io]
         let _ = v.push(i as u8)
     test.assert(v.is_full())
 
+@satisfies(REQ-DEV-007)
 @test
 fn test_wiring_read_into_fills_the_buffer_in_one_transaction() [io, hw]
     var dst = two(9, 9)
@@ -226,6 +229,7 @@ fn test_wiring_read_into_of_an_absent_device_empties_the_buffer() [io, hw]
     test.assert(dst.is_empty())
     test.assert(not dev_bus.wiring_read_into(bus(), dev_bus.wiring_spi(0, 4), 1, 1, dst))
 
+@satisfies(REQ-DEV-011)
 @test
 fn test_wiring_read_into_refuses_more_than_the_buffer_holds() [io, hw]
     var dst = two(9, 9)
@@ -261,6 +265,7 @@ fn exchange_into(pin_trip: Int, byte_trip: Int, n: Int) [hw]
                                              FakePins { trip: pin_trip }, dev_bus.wiring_spi(0, 4),
                                              two(0x9f, 0x10), n, dst)
 
+@satisfies(REQ-DEV-012)
 @test
 fn test_spi_exchange_into_selects_sends_reads_and_releases() [io, hw]
     test.assert_raises(() => exchange_into(40, -1, 1))
@@ -272,6 +277,7 @@ fn test_spi_exchange_into_selects_sends_reads_and_releases() [io, hw]
     test.assert_raises(() => exchange_into(-1, 0xff, 1))
     exchange_into(-1, 0xff, 0)
 
+@satisfies(REQ-DEV-011)
 @test
 fn test_spi_exchange_into_refuses_without_a_chip_select_or_room() [io, hw]
     var dst = two(1, 1)
@@ -281,6 +287,102 @@ fn test_spi_exchange_into_refuses_without_a_chip_select_or_room() [io, hw]
     test.assert(dst.is_empty())
     test.assert(not dev_bus.wiring_spi_exchange_into(FakeSpi { rx: [1], trip: 0x9f }, FakePins { trip: 40 },
                                                      dev_bus.wiring_spi(0, 4), two(0x9f, 0), 33, dst))
+
+// One buffered transaction that clocks out `fill` for its one byte read,
+// through a bus that panics on exchanging `byte_trip`.
+fn exchange_fill(byte_trip: Int, fill: Int) [hw]
+    var dst: DevBytes = Vec.new()
+    var tx: DevBytes = Vec.new()
+    let _ = dev_bus.wiring_spi_exchange_fill_into(FakeSpi { rx: [0], trip: byte_trip },
+                                                  FakePins { trip: -1 }, dev_bus.wiring_spi(0, 4), tx,
+                                                  1, fill, dst)
+
+@satisfies(REQ-DEV-012)
+@test
+fn test_a_read_clocks_out_the_filler_it_is_given() [io, hw]
+    // 0x00 goes out for a part that needs it, and 0xFF does not.
+    test.assert_raises(() => exchange_fill(0x00, 0x00))
+    exchange_fill(0xff, 0x00)
+    // Only the low eight bits are sent.
+    test.assert_raises(() => exchange_fill(0xa5, 0x1a5))
+    var dst = two(1, 1)
+    test.assert(dev_bus.wiring_spi_exchange_fill_into(FakeSpi { rx: [0x42], trip: -1 }, FakePins { trip: -1 },
+                                                      dev_bus.wiring_spi(0, 4), two(0x9f, 0), 2, 0x00, dst))
+    test.assert(dst.len() == 2)
+    test.assert((dst[1] as Int) == 0x42)
+    test.assert(not dev_bus.wiring_spi_exchange_fill_into(FakeSpi { rx: [0], trip: -1 }, FakePins { trip: 0 },
+                                                          dev_bus.wiring_i2c(0, 0x18), two(0x9f, 0), 1, 0x00,
+                                                          dst))
+
+// ── Registers at a 16-bit address ────────────────────────────────────
+
+// An I2C bus with one device at `addr` whose registers are numbered in
+// two bytes, high byte first, from `base`: register `base + i` reads
+// `regs[i]`.  A read whose address is not two bytes is not answered.  A
+// write is acknowledged when it reaches `addr` and its bytes are
+// `expect`.
+struct Wide
+    addr: Int
+    base: Int
+    regs: [Int]
+    expect: [Int]
+
+impl I2cBus for Wide
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr or data.len() != self.expect.len()
+            return false
+        for i in 0..data.len()
+            if (data[i] as Int) != self.expect[i]
+                return false
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.addr or tx.len() != 2
+            return None
+        let r = ((tx[0] as Int << 8) | tx[1] as Int) - self.base
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[r + i] as u8)
+        Some(out)
+
+fn wide(expect: [Int]) -> Wide
+    Wide { addr: 0x29, base: 0x010f, regs: [0xee, 0xaa, 0x10], expect: expect }
+
+@satisfies(REQ-DEV-007)
+@test
+fn test_a_16_bit_read_sends_the_high_byte_first() [io, hw]
+    var dst = two(9, 9)
+    test.assert(dev_bus.wiring_read16_into(wide([]), dev_bus.wiring_i2c(0, 0x29), 0x010f, 2, dst))
+    test.assert(dst.len() == 2)
+    test.assert((dst[0] as Int) == 0xee)
+    test.assert((dst[1] as Int) == 0xaa)
+    // Register 0x0f01 sent low byte first is the double's 0x010f.
+    test.assert(dev_bus.wiring_read16le_into(wide([]), dev_bus.wiring_i2c(0, 0x29), 0x0f01, 1, dst))
+    test.assert((dst[0] as Int) == 0xee)
+
+@satisfies(REQ-DEV-011)
+@test
+fn test_a_16_bit_read_refuses_what_wiring_read_into_refuses() [io, hw]
+    var dst = two(9, 9)
+    test.assert(not dev_bus.wiring_read16_into(wide([]), dev_bus.wiring_i2c(0, 0x30), 0x010f, 1, dst))
+    test.assert(dst.is_empty())
+    test.assert(not dev_bus.wiring_read16_into(wide([]), dev_bus.wiring_spi(0, 4), 0x010f, 1, dst))
+    test.assert(not dev_bus.wiring_read16_into(wide([]), dev_bus.wiring_i2c(0, 0x29), 0x010f, 33, dst))
+
+@test
+fn test_a_16_bit_write_sends_both_address_bytes_then_the_buffer() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x29)
+    test.assert(dev_bus.wiring_write16_from(wide([0x01, 0x0f, 0x57, 0x01]), w, 0x010f, two(0x57, 0x01)))
+    test.assert(not dev_bus.wiring_write16_from(wide([0x01, 0x0f, 0x57, 0x01]), w, 0x0f01, two(0x57, 0x01)))
+    test.assert(dev_bus.wiring_write16le_from(wide([0x0f, 0x01, 0x57, 0x01]), w, 0x010f, two(0x57, 0x01)))
+    test.assert(not dev_bus.wiring_write16_from(wide([0x01, 0x0f, 0x57, 0x01]), dev_bus.wiring_spi(0, 4), 0x010f,
+                                                two(0x57, 0x01)))
 
 // ── Sign extension ───────────────────────────────────────────────────
 

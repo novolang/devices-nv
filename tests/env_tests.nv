@@ -1,0 +1,414 @@
+// env_tests — a hygrometer and a barometer: a humidity, pressure and
+// temperature part over the I2C double, implementing three kinds from
+// one forced measurement, and recorded readings that perform nothing;
+// the linear conversions.
+
+use std.test
+use embedded_hal.{ I2cBus }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_id.{ DeviceId, Identifiable }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_hygro.{ MilliPercentRh, Hygrometer, HygrometerAsync }
+use dev_baro.{ Pascals, Barometer, BarometerAsync }
+
+// ── Doubles ──────────────────────────────────────────────────────────
+
+// An I2C bus with one device at `addr`.  Register r reads `regs[r]`, and
+// a multi-byte read continues through the following registers; a read
+// past the last register is not answered.  A write is acknowledged when
+// it reaches `addr` and its bytes are `expect`.
+struct FakeI2c
+    addr: Int
+    regs: [Int]
+    expect: [Int]
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr or data.len() != self.expect.len()
+            return false
+        for i in 0..data.len()
+            if (data[i] as Int) != self.expect[i]
+                return false
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        let r = tx[0] as Int
+        if addr != self.addr or r + n > self.regs.len()
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[r + i] as u8)
+        Some(out)
+
+// ── A humidity, pressure and temperature part over I2C ───────────────
+//
+// A part laid out as Bosch's BME280 is.  The chip ID (0xD0) reads 0x60.
+// Writing ctrl_hum (0xF2) and then ctrl_meas (0xF4), as address and data
+// pairs in one transaction, sets each measurement's oversampling and
+// starts one forced measurement of all three; at one sample each it
+// takes at most 9.3 ms.  The results are eight bytes from 0xF7: the
+// pressure and the temperature as 20-bit counts, most significant byte
+// first, then the humidity as a 16-bit count.  The counts mean nothing
+// without the part's calibration constants, 26 bytes from 0x88 and seven
+// from 0xE1, which the data sheet's integer formulas (section 4.2.3)
+// combine with them.
+
+struct Bme
+    bus: FakeI2c
+    w: DeviceWiring
+
+// The calibration constants of one part.
+struct Calib
+    t1: Int
+    t2: Int
+    t3: Int
+    p: [Int]
+    h1: Int
+    h2: Int
+    h3: Int
+    h4: Int
+    h5: Int
+    h6: Int
+
+// The three counts of one measurement.
+struct Counts
+    t: Int
+    p: Int
+    h: Int
+
+fn u16le(b: DevBytes, i: Int) -> Int
+    (b[i + 1] as Int << 8) | b[i] as Int
+
+fn s16le(b: DevBytes, i: Int) -> Int
+    dev_bus.dev_sign_extend(u16le(b, i), 16)
+
+impl Bme
+    // The calibration constants, or `None` when the part did not answer.
+    // The first block is 26 bytes, which a `DevBytes` holds.
+    fn calib(self) -> ?Calib [hw]
+        var a: DevBytes = Vec.new()
+        var h: DevBytes = Vec.new()
+        if not dev_bus.wiring_read_into(self.bus, self.w, 0x88, 26, a)
+            return None
+        if not dev_bus.wiring_read_into(self.bus, self.w, 0xe1, 7, h)
+            return None
+        var p: [Int] = []
+        for i in 0..9
+            let v = if i == 0
+                u16le(a, 6)
+            else
+                s16le(a, 6 + i * 2)
+            list.push(p, v)
+        Some(Calib { t1: u16le(a, 0), t2: s16le(a, 2), t3: s16le(a, 4), p: p, h1: a[25] as Int,
+                     h2: s16le(h, 0), h3: h[2] as Int,
+                     h4: dev_bus.dev_sign_extend((h[3] as Int << 4) | (h[4] as Int & 0x0f), 12),
+                     h5: dev_bus.dev_sign_extend((h[5] as Int << 4) | (h[4] as Int >> 4), 12),
+                     h6: dev_bus.dev_sign_extend(h[6] as Int, 8) })
+
+    fn counts(self) -> ?Counts [hw]
+        var b: DevBytes = Vec.new()
+        if not dev_bus.wiring_read_into(self.bus, self.w, 0xf7, 8, b)
+            return None
+        Some(Counts { p: (b[0] as Int << 12) | (b[1] as Int << 4) | (b[2] as Int >> 4),
+                      t: (b[3] as Int << 12) | (b[4] as Int << 4) | (b[5] as Int >> 4),
+                      h: (b[6] as Int << 8) | b[7] as Int })
+
+    // Starts one forced measurement: osrs_h = 1, then osrs_t = 1,
+    // osrs_p = 1 and the forced mode.
+    fn force(self) -> Int [hw]
+        if dev_bus.wiring_write(self.bus, self.w, 0xf2, [0x01 as u8, 0xf4 as u8, 0x25 as u8])
+            return 9300
+        -1
+
+// The fine temperature the pressure and humidity formulas take.
+fn t_fine(c: Calib, adc: Int) -> Int
+    let v1 = (((adc >> 3) - (c.t1 << 1)) * c.t2) >> 11
+    let d = (adc >> 4) - c.t1
+    let v2 = (((d * d) >> 12) * c.t3) >> 14
+    v1 + v2
+
+// The pressure in pascals, from the 64-bit formula's Q24.8 answer.
+fn pressure_pa(c: Calib, tf: Int, adc: Int) -> Int
+    var v1 = tf - 128000
+    var v2 = v1 * v1 * c.p[5]
+    v2 = v2 + ((v1 * c.p[4]) << 17)
+    v2 = v2 + (c.p[3] << 35)
+    v1 = ((v1 * v1 * c.p[2]) >> 8) + ((v1 * c.p[1]) << 12)
+    v1 = (((1 << 47) + v1) * c.p[0]) >> 33
+    if v1 == 0
+        return 0
+    var p = 1048576 - adc
+    p = ((p << 31) - v2) * 3125 / v1
+    let w1 = (c.p[8] * (p >> 13) * (p >> 13)) >> 25
+    let w2 = (c.p[7] * p) >> 19
+    (((p + w1 + w2) >> 8) + (c.p[6] << 4)) >> 8
+
+// The humidity in milli-percent, from the formula's Q22.10 answer.
+fn humidity_mpct(c: Calib, tf: Int, adc: Int) -> Int
+    var v = tf - 76800
+    let a = ((adc << 14) - (c.h4 << 20) - c.h5 * v + 16384) >> 15
+    let b = ((((((v * c.h6) >> 10) * (((v * c.h3) >> 11) + 32768)) >> 10) + 2097152) * c.h2 + 8192) >> 14
+    v = a * b
+    v = v - (((((v >> 15) * (v >> 15)) >> 7) * c.h1) >> 4)
+    if v < 0
+        v = 0
+    if v > 419430400
+        v = 419430400
+    (v >> 12) * 1000 / 1024
+
+impl Identifiable[hw] for Bme
+    fn device_id(self) -> ?DeviceId [hw]
+        dev_id.id_read_i2c(self.bus, self.w, 0xd0)
+
+impl Thermometer[hw] for Bme
+    fn temp_start(self) -> Int [hw]
+        self.force()
+
+    fn temp_read(self) -> ?TempMilliC [hw]
+        match self.calib()
+            Some(c) =>
+                match self.counts()
+                    Some(n) => Some(TempMilliC { milli_c: ((t_fine(c, n.t) * 5 + 128) >> 8) * 10 })
+                    None    => None
+            None    => None
+
+impl Hygrometer[hw] for Bme
+    fn rh_start(self) -> Int [hw]
+        self.force()
+
+    fn rh_read(self) -> ?MilliPercentRh [hw]
+        match self.calib()
+            Some(c) =>
+                match self.counts()
+                    Some(n) => Some(MilliPercentRh { milli_pct: humidity_mpct(c, t_fine(c, n.t), n.h) })
+                    None    => None
+            None    => None
+
+impl Barometer[hw] for Bme
+    fn baro_start(self) -> Int [hw]
+        self.force()
+
+    fn baro_read(self) -> ?Pascals [hw]
+        match self.calib()
+            Some(c) =>
+                match self.counts()
+                    Some(n) => Some(Pascals { pa: pressure_pa(c, t_fine(c, n.t), n.p) })
+                    None    => None
+            None    => None
+
+impl HygrometerAsync[hw] for Bme
+    async fn rh_measure(self) -> ?MilliPercentRh [hw]
+        // The double converts at once; a part on a scheduler parks here
+        // for the time `rh_start` answers.
+        let us = self.rh_start()
+        self.rh_read_after(us, us)
+
+impl BarometerAsync[hw] for Bme
+    async fn baro_measure(self) -> ?Pascals [hw]
+        let us = self.baro_start()
+        self.baro_read_after(us, us)
+
+// The register file of a part whose calibration is the data sheet's
+// worked example, holding the counts given.  The example's temperature
+// count 519888 and pressure count 415148 are 25.08 °C and 100653 Pa.
+fn bme_regs(adc_t: Int, adc_p: Int, adc_h: Int) -> [Int]
+    var r = list.zeros(256)
+    let cal = [0x70, 0x6b, 0x43, 0x67, 0x18, 0xfc, 0x7d, 0x8e, 0x43, 0xd6, 0xd0, 0x0b, 0x27, 0x0b, 0x8c, 0x00,
+               0xf9, 0xff, 0x8c, 0x3c, 0xf8, 0xc6, 0x70, 0x17, 0x00, 0x4b]
+    for i in 0..26
+        r[0x88 + i] = cal[i]
+    let calh = [0x6a, 0x01, 0x00, 0x13, 0x29, 0x03, 0x1e]
+    for i in 0..7
+        r[0xe1 + i] = calh[i]
+    r[0xd0] = 0x60
+    r[0xf7] = (adc_p >> 12) & 0xff
+    r[0xf8] = (adc_p >> 4) & 0xff
+    r[0xf9] = (adc_p & 0x0f) << 4
+    r[0xfa] = (adc_t >> 12) & 0xff
+    r[0xfb] = (adc_t >> 4) & 0xff
+    r[0xfc] = (adc_t & 0x0f) << 4
+    r[0xfd] = adc_h >> 8
+    r[0xfe] = adc_h & 0xff
+    r
+
+fn bme(regs: [Int]) -> Bme
+    Bme { bus: FakeI2c { addr: 0x76, regs: regs, expect: [0xf2, 0x01, 0xf4, 0x25] },
+          w: dev_bus.wiring_i2c(0, 0x76) }
+
+@satisfies(REQ-DEV-013)
+@test
+fn test_the_part_says_who_it_is() [io, hw]
+    test.assert(bme(bme_regs(0, 0, 0)).device_probe(0x60))
+    test.assert(not bme(bme_regs(0, 0, 0)).device_probe(0x58))
+
+@satisfies(REQ-DEV-003)
+@test
+fn test_one_forced_measurement_starts_all_three() [io, hw]
+    let p = bme(bme_regs(519888, 415148, 30000))
+    test.assert(p.temp_start() == 9300)
+    test.assert(p.rh_start() == 9300)
+    test.assert(p.baro_start() == 9300)
+    let refused = Bme { bus: FakeI2c { addr: 0x76, regs: bme_regs(0, 0, 0), expect: [] },
+                        w: dev_bus.wiring_i2c(0, 0x76) }
+    test.assert(refused.baro_start() < 0)
+    test.assert(refused.baro_read_after(100000, refused.baro_start()) == None)
+
+@test
+fn test_the_data_sheet_s_worked_example() [io, hw]
+    let p = bme(bme_regs(519888, 415148, 30000))
+    match p.temp_read()
+        Some(t) => test.assert(t.milli_c == 25080)
+        None    => test.assert(false)
+    match p.baro_read()
+        Some(b) => test.assert(b.pa == 100653)
+        None    => test.assert(false)
+    match p.rh_read()
+        Some(h) => test.assert(h.milli_pct == 54997)
+        None    => test.assert(false)
+
+@test
+fn test_a_cold_dry_sample_below_zero() [io, hw]
+    // A fine temperature below zero takes every formula through
+    // arithmetic shifts of negative values.
+    let p = bme(bme_regs(400000, 450000, 20000))
+    match p.temp_read()
+        Some(t) => test.assert(t.milli_c == -12640)
+        None    => test.assert(false)
+    match p.baro_read()
+        Some(b) => test.assert(b.pa == 89274)
+        None    => test.assert(false)
+    match p.rh_read()
+        Some(h) => test.assert(h.milli_pct == 2068)
+        None    => test.assert(false)
+
+@test
+fn test_the_humidity_is_held_within_its_range() [io, hw]
+    // A count of 0 reads 0 %, and the largest count reads at most 100 %.
+    match bme(bme_regs(519888, 415148, 0)).rh_read()
+        Some(h) => test.assert(h.milli_pct == 0)
+        None    => test.assert(false)
+    match bme(bme_regs(519888, 415148, 0xffff)).rh_read()
+        Some(h) => test.assert(h.milli_pct == 100000)
+        None    => test.assert(false)
+
+@test
+fn test_a_pressure_formula_with_no_divisor_answers_zero() [io, hw]
+    // A part whose dig_P1 reads 0 makes the formula's divisor 0.
+    var r = bme_regs(519888, 415148, 30000)
+    r[0x8e] = 0
+    r[0x8f] = 0
+    match bme(r).baro_read()
+        Some(b) => test.assert(b.pa == 0)
+        None    => test.assert(false)
+
+@satisfies(REQ-DEV-003)
+@test
+fn test_an_early_read_is_refused() [io, hw]
+    let p = bme(bme_regs(519888, 415148, 30000))
+    let us = p.rh_start()
+    test.assert(p.rh_read_after(us - 1, us) == None)
+    test.assert(p.baro_read_after(us - 1, us) == None)
+    test.assert(p.rh_read_after(us, us) != None)
+    test.assert(p.baro_read_after(us, us) != None)
+
+@satisfies(REQ-DEV-001)
+@test
+fn test_an_absent_part_answers_nothing() [io, hw]
+    let gone = Bme { bus: FakeI2c { addr: 0x77, regs: bme_regs(0, 0, 0), expect: [] },
+                     w: dev_bus.wiring_i2c(0, 0x76) }
+    test.assert(gone.temp_read() == None)
+    test.assert(gone.rh_read() == None)
+    test.assert(gone.baro_read() == None)
+    test.assert(gone.device_id() == None)
+
+@test
+fn test_a_part_that_stops_answering_after_its_calibration() [io, hw]
+    // The register file ends before the results: the calibration reads
+    // and the counts do not.
+    var r: [Int] = []
+    let all = bme_regs(519888, 415148, 30000)
+    for i in 0..0xf0
+        list.push(r, all[i])
+    let p = bme(r)
+    test.assert(p.temp_read() == None)
+    test.assert(p.rh_read() == None)
+    test.assert(p.baro_read() == None)
+    // A register file that ends inside the second calibration block.
+    var s: [Int] = []
+    for i in 0..0xe4
+        list.push(s, all[i])
+    test.assert(bme(s).baro_read() == None)
+
+@satisfies(REQ-DEV-008)
+@test
+fn test_the_async_forms_measure_once() [io, hw, async]
+    match await bme(bme_regs(519888, 415148, 30000)).rh_measure()
+        Some(h) => test.assert(h.milli_pct == 54997)
+        None    => test.assert(false)
+    match await bme(bme_regs(519888, 415148, 30000)).baro_measure()
+        Some(b) => test.assert(b.pa == 100653)
+        None    => test.assert(false)
+
+// ── Recorded readings ────────────────────────────────────────────────
+
+// A weather station's last reading, performing nothing: a part that
+// converts continuously.
+struct Station
+    milli_pct: Int
+    pa: Int
+
+impl Hygrometer[] for Station
+    fn rh_start(self) -> Int
+        0
+
+    fn rh_read(self) -> ?MilliPercentRh
+        Some(MilliPercentRh { milli_pct: self.milli_pct })
+
+impl Barometer[] for Station
+    fn baro_start(self) -> Int
+        0
+
+    fn baro_read(self) -> ?Pascals
+        Some(Pascals { pa: self.pa })
+
+// Whether the air is humid and the pressure falling below `limit`: rain
+// likely.  Generic over both kinds, each with its own effect.
+fn rain_likely<D: Hygrometer[eh] + Barometer[eb]>(d: D, limit: Int) -> Bool [eh, eb]
+    match d.rh_read_after(0, d.rh_start())
+        Some(h) =>
+            match d.baro_read_after(0, d.baro_start())
+                Some(p) => h.milli_pct > 80000 and p.pa < limit
+                None    => false
+        None    => false
+
+@test
+fn test_a_recorded_station_needs_no_hardware()
+    test.assert(rain_likely(Station { milli_pct: 90000, pa: 99000 }, 100000))
+    test.assert(not rain_likely(Station { milli_pct: 40000, pa: 99000 }, 100000))
+    test.assert(not rain_likely(Station { milli_pct: 90000, pa: 101325 }, 100000))
+
+// ── The conversions ──────────────────────────────────────────────────
+
+@test
+fn test_a_linear_humidity_count() [io]
+    test.assert(dev_hygro.rh_of_raw(32768, 65536).milli_pct == 50000)
+    test.assert(dev_hygro.rh_of_raw(65535, 65535).milli_pct == 100000)
+    test.assert(dev_hygro.rh_of_raw(70000, 65535).milli_pct == 100000)
+    test.assert(dev_hygro.rh_of_raw(1, 65536).milli_pct == 1)
+    test.assert(dev_hygro.rh_of_raw(0, 65536).milli_pct == 0)
+    test.assert(dev_hygro.rh_of_raw(-5, 65536).milli_pct == 0)
+    test.assert(dev_hygro.rh_of_raw(100, 0).milli_pct == 0)
+
+@test
+fn test_a_linear_pressure_count() [io]
+    test.assert(dev_baro.baro_of_raw(4150272, 24, 4096).pa == 101325)
+    // 260 hPa, the bottom of a typical range, and a negative count.
+    test.assert(dev_baro.baro_of_raw(1064960, 24, 4096).pa == 26000)
+    test.assert(dev_baro.baro_of_raw(0xffffff, 24, 4096).pa == 0)
+    test.assert(dev_baro.baro_of_raw(0xfff000, 24, 4096).pa == -100)

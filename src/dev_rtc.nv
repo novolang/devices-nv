@@ -30,6 +30,22 @@ struct RtcDateTime
     minute: Int
     second: Int
 
+// Which fields of an alarm's time must match the clock for the alarm
+// to fire, as a real-time clock's alarm registers select them.
+//
+// `AlarmOnce` matches the whole time and fires once.  `AlarmEverySecond`
+// matches nothing and fires each second.  `AlarmEveryMinute` matches
+// the second, so it fires once a minute; `AlarmEveryHour` the minute and
+// the second; `AlarmEveryDay` the hour, the minute and the second, so an
+// alarm at 07:00:00 every day fires each morning at seven.
+pub @value
+enum AlarmMatch
+    AlarmOnce
+    AlarmEverySecond
+    AlarmEveryMinute
+    AlarmEveryHour
+    AlarmEveryDay
+
 // What a program reads from and sets on a real-time clock.
 //
 // `rtc_now` answers the time in the clock's registers, or `None` when
@@ -37,14 +53,25 @@ struct RtcDateTime
 // whether the device took it; a driver refuses a time `rtc_is_valid`
 // refuses.  `rtc_running` answers whether the oscillator has run
 // without stopping since the clock was last set.  `rtc_set_alarm` arms
-// the clock's alarm for a time, and `rtc_cancel_alarm` disarms it; each
-// answers whether the device took it.
+// the clock's alarm to fire once, at a time, and `rtc_cancel_alarm`
+// disarms it; each answers whether the device took it.
 pub trait RealTimeClock[e]
     fn rtc_now(self) -> ?RtcDateTime [e]
     fn rtc_set(self, t: RtcDateTime) -> Bool [e]
     fn rtc_running(self) -> Bool [e]
     fn rtc_set_alarm(self, t: RtcDateTime) -> Bool [e]
     fn rtc_cancel_alarm(self) -> Bool [e]
+
+    // Arms the alarm to fire whenever the fields of `t` that `m`
+    // selects match the clock, and answers whether the device took it.
+    // The fields `m` does not select are ignored.  `AlarmOnce` is
+    // `rtc_set_alarm`.  A clock whose alarm cannot repeat refuses the
+    // other forms, which is what this body does; a driver for a clock
+    // with match registers overrides it.
+    fn rtc_set_alarm_match(self, t: RtcDateTime, m: AlarmMatch) -> Bool [e]
+        if m == AlarmOnce
+            return self.rtc_set_alarm(t)
+        false
 
     // The time, or `None` when the oscillator stopped since the clock
     // was last set, because the registers then hold a time that is not
@@ -116,6 +143,89 @@ pub fn rtc_is_valid(t: RtcDateTime) -> Bool
     if t.day < 1 or t.day > rtc_days_in_month(t.year, t.month)
         return false
     t.hour >= 0 and t.hour <= 23 and t.minute >= 0 and t.minute <= 59 and t.second >= 0 and t.second <= 59
+
+// Whether an alarm armed for `alarm` with the match `m` fires at the
+// time `now`: the fields `m` selects are equal in both.  A clock with no
+// alarm registers, or a test, compares the time with this each second.
+//
+// ```novo
+// use dev_rtc.{ RtcDateTime, AlarmMatch }
+//
+// fn main() [io]
+//     let seven = RtcDateTime { year: 2026, month: 1, day: 1, hour: 7, minute: 0, second: 0 }
+//     let now = RtcDateTime { year: 2026, month: 10, day: 7, hour: 7, minute: 0, second: 0 }
+//     println("${dev_rtc.rtc_alarm_matches(now, seven, AlarmMatch.AlarmEveryDay)}")   // true
+// ```
+pub fn rtc_alarm_matches(now: RtcDateTime, alarm: RtcDateTime, m: AlarmMatch) -> Bool
+    let s = now.second == alarm.second
+    let mi = s and now.minute == alarm.minute
+    let h = mi and now.hour == alarm.hour
+    match m
+        AlarmEverySecond => true
+        AlarmEveryMinute => s
+        AlarmEveryHour   => mi
+        AlarmEveryDay    => h
+        AlarmOnce        => h and now.day == alarm.day and now.month == alarm.month and now.year == alarm.year
+
+// The number of seconds from 1970-01-01 00:00:00 to `t`, the count Unix
+// time keeps, or `None` for a time `rtc_is_valid` refuses and for a time
+// before 1970.  The count has no leap seconds, as Unix time has none,
+// and `t` is read as Coordinated Universal Time (UTC) whatever zone the
+// clock was set in.
+//
+// ```novo
+// use dev_rtc.{ RtcDateTime }
+//
+// fn main() [io]
+//     let t = RtcDateTime { year: 2000, month: 1, day: 1, hour: 0, minute: 0, second: 0 }
+//     println("${dev_rtc.rtc_to_unix(t) ?? -1}")   // 946684800
+// ```
+pub fn rtc_to_unix(t: RtcDateTime) -> ?Int
+    if not rtc_is_valid(t) or t.year < 1970
+        return None
+    Some(days_from_civil(t.year, t.month, t.day) * 86400 + t.hour * 3600 + t.minute * 60 + t.second)
+
+// The date and time `sec` seconds after 1970-01-01 00:00:00, or `None`
+// for a negative count.  The inverse of `rtc_to_unix`.
+pub fn rtc_from_unix(sec: Int) -> ?RtcDateTime
+    if sec < 0
+        return None
+    let days = sec / 86400
+    let rest = sec % 86400
+    // The civil date of a day count, after Howard Hinnant's
+    // civil_from_days: the year is counted from 1 March, so that the
+    // leap day falls at its end, in eras of 400 years.
+    let z = days + 719468
+    let era = z / 146097
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10
+        mp + 3
+    else
+        mp - 9
+    let y = yoe + era * 400 + (if m <= 2 then 1 else 0)
+    Some(RtcDateTime { year: y, month: m, day: d, hour: rest / 3600, minute: rest % 3600 / 60,
+                       second: rest % 60 })
+
+// The number of days from 1970-01-01 to a date on or after it, after
+// Howard Hinnant's days_from_civil.
+fn days_from_civil(year: Int, month: Int, day: Int) -> Int
+    let y = if month <= 2
+        year - 1
+    else
+        year
+    let era = y / 400
+    let yoe = y - era * 400
+    let mp = if month > 2
+        month - 3
+    else
+        month + 9
+    let doy = (153 * mp + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
 
 // The day of the week of a date, ISO 8601 numbering: 1 is Monday and 7
 // is Sunday.  A part with a weekday register takes it from here, since

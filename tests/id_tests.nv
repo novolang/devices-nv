@@ -1,0 +1,145 @@
+// id_tests — a part's identification byte read with no driver over the
+// I2C and SPI doubles, a board bring-up that scans a bus for it, and the
+// `Identifiable` trait implemented by a recorded part.
+
+use std.test
+use embedded_hal.{ I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring }
+use dev_id.{ DeviceId, Identifiable }
+
+// ── Doubles ──────────────────────────────────────────────────────────
+
+// An I2C bus with one device at `addr`.  Register r reads `regs[r]`.
+struct FakeI2c
+    addr: Int
+    regs: [Int]
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        false
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        let r = tx[0] as Int
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[r + i] as u8)
+        Some(out)
+
+// An SPI bus whose one-byte exchanges answer `rx`; an exchange of the
+// byte `trip` panics.
+struct FakeSpi
+    rx: Int
+    trip: Int
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        pass
+
+    fn transfer(self, b: Int) -> Int [hw]
+        if b == self.trip
+            panic.panic("spi transfer")
+        self.rx
+
+    fn write(self, data: [u8]) [hw]
+        pass
+
+    fn read(self, n: Int) -> [u8] [hw]
+        []
+
+// A GPIO port that drives nothing.
+struct FakePins
+    trip: Int
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        pass
+
+    fn set(self, pin: Int, val: Int) [hw]
+        if pin * 10 + val == self.trip
+            panic.panic("gpio set")
+
+    fn get(self, pin: Int) -> Int [hw]
+        0
+
+// An LIS3DH at 0x18: WHO_AM_I (0x0F) reads 0x33.
+fn lis3dh_bus() -> FakeI2c
+    var r = list.zeros(16)
+    r[0x0f] = 0x33
+    FakeI2c { addr: 0x18, regs: r }
+
+// ── Without a driver ─────────────────────────────────────────────────
+
+@test
+fn test_an_i2c_part_answers_its_identification_byte() [io, hw]
+    match dev_id.id_read_i2c(lis3dh_bus(), dev_bus.wiring_i2c(0, 0x18), 0x0f)
+        Some(id) => test.assert(id.who == 0x33)
+        None     => test.assert(false)
+    test.assert(dev_id.id_read_i2c(lis3dh_bus(), dev_bus.wiring_i2c(0, 0x19), 0x0f) == None)
+    test.assert(dev_id.id_read_i2c(lis3dh_bus(), dev_bus.wiring_spi(0, 4), 0x0f) == None)
+
+@test
+fn test_an_spi_part_answers_its_identification_byte() [io, hw]
+    // The command 0x8F reads register 0x0F.
+    let w = dev_bus.wiring_spi(0, 4)
+    match dev_id.id_read_spi(FakeSpi { rx: 0x33, trip: -1 }, FakePins { trip: -1 }, w, 0x8f)
+        Some(id) => test.assert(id.who == 0x33)
+        None     => test.assert(false)
+    test.assert_raises(() => read_spi(0x8f))
+    test.assert(dev_id.id_read_spi(FakeSpi { rx: 0x33, trip: -1 }, FakePins { trip: 0 },
+                                   dev_bus.wiring_i2c(0, 0x18), 0x8f) == None)
+
+fn read_spi(trip: Int) [hw]
+    let _ = dev_id.id_read_spi(FakeSpi { rx: 0, trip: trip }, FakePins { trip: -1 }, dev_bus.wiring_spi(0, 4),
+                               0x8f)
+
+// The first address from `lo` to `hi` at which a part answers `who` at
+// register `reg`, or -1: a board bring-up's scan.
+fn scan<B: I2cBus>(bus: B, lo: Int, hi: Int, reg: Int, who: Int) -> Int [hw]
+    for a in lo..hi + 1
+        match dev_id.id_read_i2c(bus, dev_bus.wiring_i2c(0, a), reg)
+            Some(id) =>
+                if id.who == who
+                    return a
+            None     => ()
+    -1
+
+@test
+fn test_a_bring_up_scan_finds_the_part() [io, hw]
+    test.assert(scan(lis3dh_bus(), 0x08, 0x77, 0x0f, 0x33) == 0x18)
+    test.assert(scan(lis3dh_bus(), 0x08, 0x77, 0x0f, 0x6c) == -1)
+
+// ── Through the trait ────────────────────────────────────────────────
+
+// A part that answered `who` when it was recorded, performing nothing;
+// a negative `who` is a part that did not answer.
+struct Recorded
+    who: Int
+
+impl Identifiable[] for Recorded
+    fn device_id(self) -> ?DeviceId
+        if self.who < 0
+            return None
+        Some(DeviceId { who: self.who })
+
+// The number of the parts that answer as expected, generic over the
+// part and its effect.
+fn present<D: Identifiable[e]>(d: D, expect: Int) -> Int [e]
+    if d.device_probe(expect)
+        1
+    else
+        0
+
+@satisfies(REQ-DEV-013)
+@test
+fn test_a_probe_compares_the_identification_byte()
+    test.assert(present(Recorded { who: 0x60 }, 0x60) == 1)
+    test.assert(present(Recorded { who: 0x58 }, 0x60) == 0)
+    test.assert(present(Recorded { who: -1 }, 0x60) == 0)

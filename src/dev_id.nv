@@ -1,0 +1,68 @@
+// dev_id — which part answers at a place on the bus.
+//
+// Most sensors hold a fixed identification byte in a register of their
+// own, which ST's data sheets call WHO_AM_I and Bosch's call the chip
+// ID: an LIS3DH answers 0x33 at register 0x0F, a BME280 answers 0x60 at
+// register 0xD0.  Reading that byte is the first thing a board's
+// bring-up does: it shows the part is wired, powered and the part the
+// board says it is, before any driver configures it.
+//
+// `Identifiable` is the trait a driver implements to answer it.  The
+// functions `id_read_i2c` and `id_read_spi` read the byte from a part
+// with no driver at all, so a program can scan a bus for the parts it
+// expects.
+
+use dev_bus.{ DeviceWiring, DevBytes }
+use embedded_hal.{ I2cBus, SpiBus, GpioOut }
+
+// What a part says it is: `who` is its identification byte.
+pub @value
+struct DeviceId
+    who: Int
+
+// A part that reports its identity.
+//
+// `device_id` answers the part's identification, or `None` when the
+// part did not answer on the bus.
+pub trait Identifiable[e]
+    fn device_id(self) -> ?DeviceId [e]
+
+    // Whether the part answers with the identification byte `expect`.
+    // A part that does not answer, and a part that answers another
+    // byte, answer `false`: either way the board does not carry the
+    // part the program expects at this place.
+    fn device_probe(self, expect: Int) -> Bool [e]
+        match self.device_id()
+            Some(id) => id.who == expect
+            None     => false
+
+// The identification byte at register `reg` of an I2C part, read in one
+// transaction.  `None` when the part did not answer, and for a wiring
+// that is not on I2C.
+//
+// ```novo norun:fragment
+// use embedded_hal.{ BoardI2c }
+//
+// // An LIS3DH at 0x18 answers 0x33 at register 0x0F.
+// match dev_id.id_read_i2c(BoardI2c { id: 0 }, dev_bus.wiring_i2c(0, 0x18), 0x0f)
+//     Some(id) => id.who == 0x33
+//     None     => false
+// ```
+pub fn id_read_i2c<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?DeviceId [hw]
+    var b: DevBytes = Vec.new()
+    if not dev_bus.wiring_read_into(bus, w, reg, 1, b)
+        return None
+    Some(DeviceId { who: b[0] as Int })
+
+// The identification byte of an SPI part, read in one transaction that
+// sends the command byte `cmd` and reads one byte back.  The command is
+// the part's own: many sensors read register r with the command
+// 0x80 | r.  `None` for a wiring with no chip-select pin.
+pub fn id_read_spi<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring,
+                                          cmd: Int) -> ?DeviceId [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push(cmd as u8)
+    var rx: DevBytes = Vec.new()
+    if not dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 1, rx)
+        return None
+    Some(DeviceId { who: rx[0] as Int })

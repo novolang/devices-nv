@@ -9,7 +9,7 @@
 // and each build produces a Cortex-M ELF or fails.  The tier check holds
 // every function of every module a device build includes at
 // `@tier(embedded)`, whether or not the firmware calls it, so a build
-// that links is the claim that all five modules check clean there: the
+// that links is the claim that every module checks clean there: the
 // probe names each of them.
 //
 // The driver below is laid out as a real part is, a TI TMP102
@@ -17,12 +17,18 @@
 // in a `DevBytes` of its own, so it builds no list and needs no
 // `system` block.  The second half runs an SPI transaction the same
 // way.  On a board with no device at either place the reads answer
-// `false` or `None`, and the image still reports and parks.
+// `false` or `None`, and the image still reports and parks.  On the
+// emulated board `tests/embedded_probe.sh` runs the image and reads the
+// score line, so the probe's arithmetic is checked as well as built.
 
 use dev_bus.{ DeviceWiring, DevBytes }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_power.{ MilliVolts, ChargeState }
-use dev_rtc.{ RtcDateTime }
+use dev_rtc.{ RtcDateTime, AlarmMatch }
+use dev_accel.{ AccelMilliG }
+use dev_gyro.{ GyroMilliDps }
+use dev_mag.{ MagNanoT }
+use dev_imu.{ ImuSample9 }
 use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio }
 
 // A TMP102 on the board's I2C bus.  Its temperature register, 0, holds
@@ -94,10 +100,58 @@ fn score() -> Int [hw]
     if dev_power.power_is_charging(ChargeState.ChargeConstantCurrent)
         n = n + 32
 
-    // dev_rtc: BCD, validity and the day of the week.
+    // dev_rtc: BCD, validity, the day of the week, Unix time and an
+    // alarm's match.
     let d = RtcDateTime { year: 2026, month: 10, day: 7, hour: 12, minute: 0, second: 0 }
     if dev_rtc.rtc_is_valid(d)
         n = n + dev_rtc.rtc_weekday(d) + dev_rtc.rtc_from_bcd(0x59)
+    match dev_rtc.rtc_to_unix(d)
+        Some(u) =>
+            match dev_rtc.rtc_from_unix(u + 86400)
+                Some(e) =>
+                    n = n + e.day
+                None    =>
+                    n = n + 64
+        None    =>
+            n = n + 128
+    if dev_rtc.rtc_alarm_matches(d, d, AlarmMatch.AlarmEveryDay)
+        n = n + 256
+
+    // dev_id: the identification byte of a part on the I2C bus, and of
+    // the flash on SPI.
+    match dev_id.id_read_i2c(BoardI2c { id: 0 }, dev_bus.wiring_i2c(0, 0x6a), 0x0f)
+        Some(id) =>
+            n = n + id.who
+        None     =>
+            n = n + 512
+    match dev_id.id_read_spi(BoardSpi { id: 0 }, BoardGpio { id: 0 }, flash, 0x9f)
+        Some(id) =>
+            n = n + id.who
+        None     =>
+            n = n + 1024
+
+    // dev_bus: a 16-bit register address, and an SPI read clocking 0x00.
+    var b16: DevBytes = Vec.new()
+    if dev_bus.wiring_read16_into(BoardI2c { id: 0 }, dev_bus.wiring_i2c(0, 0x29), 0x010f, 1, b16)
+        n = n + b16.len()
+    if dev_bus.wiring_spi_exchange_fill_into(BoardSpi { id: 0 }, BoardGpio { id: 0 }, flash, tx, 1, 0x00, rx)
+        n = n + rx.len()
+
+    // dev_gyro, dev_mag, dev_hygro, dev_baro and dev_imu: their
+    // conversions and a paired sample.
+    n = n + dev_gyro.gyro_milli_dps(1000, 16, 8750) / 1000
+    n = n + dev_mag.mag_nano_t(6842, 16, 14616) / 1000
+    n = n + dev_hygro.rh_of_raw(32768, 65536).milli_pct / 1000
+    n = n + dev_baro.baro_of_raw(4150272, 24, 4096).pa / 1000
+    match dev_gyro.gyro_range_for(300000)
+        Some(r) =>
+            n = n + dev_gyro.gyro_full_scale(r)
+        None    =>
+            n = n + 2048
+    let s9 = ImuSample9 { accel: AccelMilliG { x: 0, y: 0, z: 1000 },
+                          gyro: GyroMilliDps { x: 1, y: 2, z: 3 },
+                          mag: MagNanoT { x: 0, y: 0, z: 0 } }
+    n = n + dev_imu.imu_six_of_nine(s9).gyro.z
     n
 
 fn main() [hw]

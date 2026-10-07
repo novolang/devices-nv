@@ -1,0 +1,119 @@
+// dev_gyro — a gyroscope: a device that measures the rate of rotation
+// about three axes.
+//
+// A gyroscope at rest reads zero on every axis, give or take a small
+// offset, and reads the speed at which the board turns about each axis
+// while it moves.  A reading here is in thousandths of a degree per
+// second (milli-degrees per second, mdps), the unit the parts' data
+// sheets state their sensitivity in.
+//
+// The part measures within a range, its full scale: ±250, ±500, ±1000
+// or ±2000 degrees per second.  A wider range reaches faster turns and
+// resolves slow ones more coarsely.  The range is a type, `GyroRange`,
+// so a program cannot pass a number the part does not support.
+//
+// The part samples at a fixed rate and sets a data-ready flag when a
+// new sample is complete, as an accelerometer does.  A gyroscope and an
+// accelerometer are often one part, an inertial measurement unit (IMU),
+// which `dev_imu` names.
+
+use dev_bus.{ dev_sign_extend }
+
+// One sample: the rate of rotation about each axis, in milli-degrees per
+// second.
+pub @value
+struct GyroMilliDps
+    x: Int
+    y: Int
+    z: Int
+
+// The full-scale range of a gyroscope.
+pub @value
+enum GyroRange
+    GyroRange250dps
+    GyroRange500dps
+    GyroRange1000dps
+    GyroRange2000dps
+
+// What a program reads from a gyroscope.
+//
+// `gyro_read` answers the most recent sample, or `None` when the device
+// did not answer.  `gyro_ready` answers whether a sample has completed
+// since the last read, from the part's data-ready flag.  `gyro_range`
+// and `gyro_set_range` read and change the full scale; the setter
+// answers whether the device took it.  `gyro_rate_hz` answers the
+// sample rate in samples per second.
+pub trait Gyroscope[e]
+    fn gyro_read(self) -> ?GyroMilliDps [e]
+    fn gyro_ready(self) -> Bool [e]
+    fn gyro_range(self) -> GyroRange [e]
+    fn gyro_set_range(self, r: GyroRange) -> Bool [e]
+    fn gyro_rate_hz(self) -> Int [e]
+
+    // A new sample, or `None` when none has completed since the last
+    // read or the device did not answer.
+    fn gyro_read_new(self) -> ?GyroMilliDps [e]
+        if not self.gyro_ready()
+            return None
+        self.gyro_read()
+
+// A gyroscope on a host's scheduler: `gyro_next` parks the task until
+// the part's next sample is complete and answers it.  At
+// `@tier(embedded)` a device implements `dev_bus.AsyncDeviceReady`
+// instead.
+pub trait GyroscopeAsync[e]
+    async fn gyro_next(self) -> ?GyroMilliDps [e]
+
+// The full scale of a range in degrees per second: 250, 500, 1000 or
+// 2000.
+//
+// ```novo
+// use dev_gyro.{ GyroRange }
+//
+// fn main() [io]
+//     println("${dev_gyro.gyro_full_scale(GyroRange.GyroRange500dps)}")   // 500
+// ```
+pub fn gyro_full_scale(r: GyroRange) -> Int
+    match r
+        GyroRange250dps  => 250
+        GyroRange500dps  => 500
+        GyroRange1000dps => 1000
+        GyroRange2000dps => 2000
+
+// The narrowest range whose full scale reaches `peak` milli-degrees per
+// second, or `None` when `peak` is beyond ±2000 degrees per second.
+pub fn gyro_range_for(peak: Int) -> ?GyroRange
+    let p = if peak < 0
+        0 - peak
+    else
+        peak
+    if p <= 250000
+        return Some(GyroRange250dps)
+    if p <= 500000
+        return Some(GyroRange500dps)
+    if p <= 1000000
+        return Some(GyroRange1000dps)
+    if p <= 2000000
+        return Some(GyroRange2000dps)
+    None
+
+// The rate in milli-degrees per second that a raw count means, from the
+// part's sensitivity.
+//
+// `raw` is the axis's count right-justified, and `bits` is how many bits
+// it has; the count is two's complement.  `micro_dps_per_lsb` is the
+// sensitivity the data sheet gives for the range in use, in millionths
+// of a degree per second for each step: ST's parts give 8.75 mdps per
+// step at ±250 dps, which is 8750.  The answer is rounded toward zero.
+//
+// A data sheet's sensitivity is not always the full scale divided by
+// the count's range, so a driver takes it from the table rather than
+// computing it from `gyro_full_scale`.
+//
+// ```novo
+// fn main() [io]
+//     // 1000 steps of 8.75 mdps.
+//     println("${dev_gyro.gyro_milli_dps(1000, 16, 8750)}")   // 8750
+// ```
+pub fn gyro_milli_dps(raw: Int, bits: Int, micro_dps_per_lsb: Int) -> Int
+    dev_sign_extend(raw, bits) * micro_dps_per_lsb / 1000

@@ -42,12 +42,35 @@ enum AccelRange
 // and `accel_set_range` read and change the full scale; the setter
 // answers whether the device took it.  `accel_rate_hz` answers the
 // sample rate in samples per second.
+//
+// The methods with a body below have one that suits a part without the
+// feature, and a driver for a part with it overrides them.
 pub trait Accelerometer[e]
     fn accel_read(self) -> ?AccelMilliG [e]
     fn accel_ready(self) -> Bool [e]
     fn accel_range(self) -> AccelRange [e]
     fn accel_set_range(self, r: AccelRange) -> Bool [e]
     fn accel_rate_hz(self) -> Int [e]
+
+    // Sets the sample rate to the slowest rate the part has at or above
+    // `hz`, or its fastest when `hz` is beyond it, and answers the rate
+    // the part took in samples per second.  A part's rates are a fixed
+    // list, 1, 10, 25, 50, 100 Hz and on, so the answer is rarely the
+    // request.  A part whose rate is fixed answers its rate unchanged.
+    fn accel_set_rate_hz(self, hz: Int) -> Int [e]
+        self.accel_rate_hz()
+
+    // How many samples the part's FIFO holds, a buffer in the part that
+    // keeps samples while the program is busy; 0 for a part without one.
+    fn accel_fifo_count(self) -> Int [e]
+        0
+
+    // Moves up to 32 samples out of the part's FIFO into `dst`, oldest
+    // first, and answers how many it moved.  `dst` is emptied first.  A
+    // part without a FIFO moves nothing and answers 0.
+    fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [e]
+        dst.clear()
+        0
 
     // A new sample, or `None` when none has completed since the last
     // read or the device did not answer.  A loop that polls this never

@@ -1,0 +1,708 @@
+// imu_tests — a gyroscope, a magnetometer and the IMU bundles: a
+// six-axis part and a magnetometer over the I2C double, the nine-axis
+// pair of them, and a recorded IMU that performs nothing; the ranges
+// and the count conversions.
+
+use std.test
+use embedded_hal.{ I2cBus }
+use dev_bus.{ DeviceWiring }
+use dev_id.{ DeviceId, Identifiable }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer, AccelerometerAsync }
+use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope, GyroscopeAsync }
+use dev_mag.{ MagNanoT, Magnetometer, MagnetometerAsync }
+use dev_imu.{ ImuSample, ImuSample9, Imu, Imu9 }
+
+// ── Doubles ──────────────────────────────────────────────────────────
+
+// An I2C bus with one device at `addr`.  Register r reads `regs[r]`, and
+// a multi-byte read continues through the following registers; a read
+// past the last register is not answered.  A write is acknowledged when
+// it reaches `addr` and its bytes are `expect`.
+struct FakeI2c
+    addr: Int
+    regs: [Int]
+    expect: [Int]
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr or data.len() != self.expect.len()
+            return false
+        for i in 0..data.len()
+            if (data[i] as Int) != self.expect[i]
+                return false
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        let r = tx[0] as Int
+        if addr != self.addr or r + n > self.regs.len()
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, self.regs[r + i] as u8)
+        Some(out)
+
+// The signed 16-bit value of the little-endian bytes at `i`.
+fn le16(b: [u8], i: Int) -> Int
+    dev_bus.dev_sign_extend((b[i + 1] as Int << 8) | b[i] as Int, 16)
+
+// ── A six-axis part over I2C ─────────────────────────────────────────
+//
+// An accelerometer and gyroscope laid out as ST's LSM6DSO is.  WHO_AM_I
+// (0x0F) reads 0x6C.  CTRL1_XL (0x10) holds the accelerometer's output
+// data rate in bits 7 to 4 and its full scale in bits 3 and 2, coded
+// 0 for ±2 g, 1 for ±16 g, 2 for ±4 g and 3 for ±8 g.  CTRL2_G (0x11)
+// holds the gyroscope's rate and full scale the same way, coded 0 to 3
+// for ±250 to ±2000 dps.  STATUS_REG (0x1E) has the accelerometer's
+// data-ready flag in bit 0 and the gyroscope's in bit 1.  The gyroscope's
+// axes are six bytes from OUTX_L_G (0x22) and the accelerometer's six
+// more from OUTX_L_A (0x28), each a little-endian 16-bit count, so one
+// read of twelve bytes takes both.  FIFO_STATUS1 and FIFO_STATUS2 (0x3A,
+// 0x3B) count the FIFO's words in ten bits, and each word is seven bytes
+// from FIFO_DATA_OUT_TAG (0x78): a tag whose top five bits are 2 for an
+// accelerometer sample, then the sample.
+
+struct Lsm6
+    bus: FakeI2c
+    w: DeviceWiring
+
+// The output data rate of a CTRL1_XL or CTRL2_G code, whole hertz.
+fn odr_of_code(code: Int) -> Int
+    match code
+        1  => 12
+        2  => 26
+        3  => 52
+        4  => 104
+        5  => 208
+        6  => 416
+        7  => 833
+        8  => 1666
+        9  => 3333
+        10 => 6666
+        _  => 0
+
+fn accel_range_of(code: Int) -> AccelRange
+    match code
+        1 => AccelRange16g
+        2 => AccelRange4g
+        3 => AccelRange8g
+        _ => AccelRange2g
+
+fn accel_code_of(r: AccelRange) -> Int
+    match r
+        AccelRange2g  => 0
+        AccelRange16g => 1
+        AccelRange4g  => 2
+        AccelRange8g  => 3
+
+// The accelerometer's sensitivity in micro-g per step.
+fn accel_ug_per_lsb(r: AccelRange) -> Int
+    match r
+        AccelRange2g  => 61
+        AccelRange4g  => 122
+        AccelRange8g  => 244
+        AccelRange16g => 488
+
+fn gyro_range_of(code: Int) -> GyroRange
+    match code
+        1 => GyroRange500dps
+        2 => GyroRange1000dps
+        3 => GyroRange2000dps
+        _ => GyroRange250dps
+
+fn gyro_code_of(r: GyroRange) -> Int
+    match r
+        GyroRange250dps  => 0
+        GyroRange500dps  => 1
+        GyroRange1000dps => 2
+        GyroRange2000dps => 3
+
+// The gyroscope's sensitivity in micro-dps per step.
+fn gyro_udps_per_lsb(r: GyroRange) -> Int
+    match r
+        GyroRange250dps  => 8750
+        GyroRange500dps  => 17500
+        GyroRange1000dps => 35000
+        GyroRange2000dps => 70000
+
+fn accel_of(b: [u8], i: Int, r: AccelRange) -> AccelMilliG
+    let k = accel_ug_per_lsb(r)
+    AccelMilliG { x: le16(b, i) * k / 1000,
+        y: le16(b, i + 2) * k / 1000,
+        z: le16(b, i + 4) * k / 1000 }
+
+fn gyro_of(b: [u8], i: Int, r: GyroRange) -> GyroMilliDps
+    let k = gyro_udps_per_lsb(r)
+    GyroMilliDps { x: dev_gyro.gyro_milli_dps(le16(b, i), 16, k), y: dev_gyro.gyro_milli_dps(le16(b, i + 2), 16, k),
+                   z: dev_gyro.gyro_milli_dps(le16(b, i + 4), 16, k) }
+
+impl Lsm6
+    // One register's byte, or `None` when the part did not answer.
+    fn reg(self, r: Int) -> ?Int [hw]
+        match dev_bus.wiring_read(self.bus, self.w, r, 1)
+            Some(b) => Some(b[0] as Int)
+            None    => None
+
+impl Identifiable[hw] for Lsm6
+    fn device_id(self) -> ?DeviceId [hw]
+        dev_id.id_read_i2c(self.bus, self.w, 0x0f)
+
+impl Accelerometer[hw] for Lsm6
+    fn accel_read(self) -> ?AccelMilliG [hw]
+        let r = self.accel_range()
+        match dev_bus.wiring_read(self.bus, self.w, 0x28, 6)
+            Some(b) => Some(accel_of(b, 0, r))
+            None    => None
+
+    fn accel_ready(self) -> Bool [hw]
+        ((self.reg(0x1e) ?? 0) & 0x01) != 0
+
+    fn accel_range(self) -> AccelRange [hw]
+        accel_range_of(((self.reg(0x10) ?? 0) >> 2) & 3)
+
+    fn accel_set_range(self, r: AccelRange) -> Bool [hw]
+        let c = self.reg(0x10) ?? 0
+        dev_bus.wiring_write(self.bus, self.w, 0x10, [((c & 0xf3) | (accel_code_of(r) << 2)) as u8])
+
+    fn accel_rate_hz(self) -> Int [hw]
+        odr_of_code((self.reg(0x10) ?? 0) >> 4)
+
+    fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
+        var code = 10
+        for k in 1..11
+            if odr_of_code(k) >= hz and code == 10
+                code = k
+        let c = self.reg(0x10) ?? 0
+        if dev_bus.wiring_write(self.bus, self.w, 0x10, [((code << 4) | (c & 0x0f)) as u8])
+            return odr_of_code(code)
+        self.accel_rate_hz()
+
+    fn accel_fifo_count(self) -> Int [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x3a, 2)
+            Some(b) => ((b[1] as Int & 0x03) << 8) | b[0] as Int
+            None    => 0
+
+    fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
+        dst.clear()
+        let r = self.accel_range()
+        let n = self.accel_fifo_count()
+        for i in 0..n
+            if dst.is_full()
+                break
+            match dev_bus.wiring_read(self.bus, self.w, 0x78, 7)
+                Some(b) =>
+                    if (b[0] as Int >> 3) == 0x02
+                        let _ = dst.push(accel_of(b, 1, r))
+                None    =>
+                    break
+        dst.len()
+
+impl Gyroscope[hw] for Lsm6
+    fn gyro_read(self) -> ?GyroMilliDps [hw]
+        let r = self.gyro_range()
+        match dev_bus.wiring_read(self.bus, self.w, 0x22, 6)
+            Some(b) => Some(gyro_of(b, 0, r))
+            None    => None
+
+    fn gyro_ready(self) -> Bool [hw]
+        ((self.reg(0x1e) ?? 0) & 0x02) != 0
+
+    fn gyro_range(self) -> GyroRange [hw]
+        gyro_range_of(((self.reg(0x11) ?? 0) >> 2) & 3)
+
+    fn gyro_set_range(self, r: GyroRange) -> Bool [hw]
+        let c = self.reg(0x11) ?? 0
+        dev_bus.wiring_write(self.bus, self.w, 0x11, [((c & 0xf3) | (gyro_code_of(r) << 2)) as u8])
+
+    fn gyro_rate_hz(self) -> Int [hw]
+        odr_of_code((self.reg(0x11) ?? 0) >> 4)
+
+impl Imu[hw] for Lsm6
+    // Both kinds in one read of twelve bytes from OUTX_L_G.
+    fn imu_read(self) -> ?ImuSample [hw]
+        let ar = self.accel_range()
+        let gr = self.gyro_range()
+        match dev_bus.wiring_read(self.bus, self.w, 0x22, 12)
+            Some(b) => Some(ImuSample { accel: accel_of(b, 6, ar), gyro: gyro_of(b, 0, gr) })
+            None    => None
+
+impl AccelerometerAsync[hw] for Lsm6
+    async fn accel_next(self) -> ?AccelMilliG [hw]
+        self.accel_read_new()
+
+impl GyroscopeAsync[hw] for Lsm6
+    async fn gyro_next(self) -> ?GyroMilliDps [hw]
+        self.gyro_read_new()
+
+// The register file of the part at rest, flat on a table: the
+// accelerometer at 104 Hz and ±4 g reads +1 g on z, the gyroscope at
+// 104 Hz and ±250 dps reads 8.75 dps on x and -8.75 dps on y, with both
+// samples waiting when `ready` is set.  The FIFO holds `fifo` words, each
+// the accelerometer's sample.
+fn lsm6_regs(ready: Bool, fifo: Int) -> [Int]
+    var r = list.zeros(128)
+    r[0x0f] = 0x6c
+    r[0x10] = 0x48
+    r[0x11] = 0x40
+    r[0x1e] = if ready
+        0x03
+    else
+        0x00
+    // Gyroscope x = 1000 counts, y = -1000 counts (0xfc18).
+    r[0x22] = 0xe8
+    r[0x23] = 0x03
+    r[0x24] = 0x18
+    r[0x25] = 0xfc
+    // Accelerometer z = 8197 counts (0x2005) at 122 micro-g.
+    r[0x2c] = 0x05
+    r[0x2d] = 0x20
+    r[0x3a] = fifo & 0xff
+    r[0x3b] = (fifo >> 8) & 0x03
+    r[0x78] = 0x02 << 3
+    r[0x7d] = 0x05
+    r[0x7e] = 0x20
+    r
+
+fn lsm6(regs: [Int], expect: [Int]) -> Lsm6
+    Lsm6 { bus: FakeI2c { addr: 0x6a, regs: regs, expect: expect }, w: dev_bus.wiring_i2c(0, 0x6a) }
+
+fn gone6() -> Lsm6
+    Lsm6 { bus: FakeI2c { addr: 0x6b, regs: lsm6_regs(true, 0), expect: [] },
+        w: dev_bus.wiring_i2c(0, 0x6a) }
+
+@satisfies(REQ-DEV-013)
+@test
+fn test_the_part_says_who_it_is() [io, hw]
+    test.assert(lsm6(lsm6_regs(true, 0), []).device_probe(0x6c))
+    test.assert(not lsm6(lsm6_regs(true, 0), []).device_probe(0x6b))
+    test.assert(not gone6().device_probe(0x6c))
+
+@test
+fn test_the_gyroscope_reads_its_axes_at_the_part_s_sensitivity() [io, hw]
+    let p = lsm6(lsm6_regs(true, 0), [])
+    match p.gyro_read()
+        Some(g) =>
+            test.assert(g.x == 8750)
+            test.assert(g.y == -8750)
+            test.assert(g.z == 0)
+        None    => test.assert(false)
+    test.assert(p.gyro_range() == GyroRange250dps)
+    test.assert(p.gyro_rate_hz() == 104)
+
+@test
+fn test_a_wider_gyroscope_range_scales_the_reading() [io, hw]
+    var r = lsm6_regs(true, 0)
+    r[0x11] = 0x4c
+    let p = lsm6(r, [])
+    test.assert(p.gyro_range() == GyroRange2000dps)
+    match p.gyro_read()
+        Some(g) => test.assert(g.x == 70000)
+        None    => test.assert(false)
+    r[0x11] = 0x44
+    test.assert(lsm6(r, []).gyro_range() == GyroRange500dps)
+    r[0x11] = 0x48
+    test.assert(lsm6(r, []).gyro_range() == GyroRange1000dps)
+
+@test
+fn test_gyroscope_set_range_keeps_the_rate_bits() [io, hw]
+    // 104 Hz (0x40) with ±1000 dps (code 2) is 0x48.
+    test.assert(lsm6(lsm6_regs(true, 0), [0x11, 0x48]).gyro_set_range(GyroRange1000dps))
+    test.assert(lsm6(lsm6_regs(true, 0), [0x11, 0x44]).gyro_set_range(GyroRange500dps))
+    test.assert(lsm6(lsm6_regs(true, 0), [0x11, 0x4c]).gyro_set_range(GyroRange2000dps))
+    test.assert(lsm6(lsm6_regs(true, 0), [0x11, 0x40]).gyro_set_range(GyroRange250dps))
+    test.assert(not lsm6(lsm6_regs(true, 0), [0x11, 0x40]).gyro_set_range(GyroRange500dps))
+
+@satisfies(REQ-DEV-002)
+@test
+fn test_gyroscope_read_new_answers_only_a_new_sample() [io, hw]
+    test.assert(lsm6(lsm6_regs(false, 0), []).gyro_read_new() == None)
+    match lsm6(lsm6_regs(true, 0), []).gyro_read_new()
+        Some(g) => test.assert(g.x == 8750)
+        None    => test.assert(false)
+
+@test
+fn test_the_accelerometer_of_the_same_part() [io, hw]
+    let p = lsm6(lsm6_regs(true, 0), [])
+    match p.accel_read()
+        Some(a) => test.assert(a.z == 1000)
+        None    => test.assert(false)
+    test.assert(p.accel_range() == AccelRange4g)
+    test.assert(p.accel_rate_hz() == 104)
+    test.assert(p.accel_ready())
+    test.assert(not lsm6(lsm6_regs(false, 0), []).accel_ready())
+    // ±4 g (code 2) to ±16 g (code 1) keeps the rate bits: 0x44.
+    test.assert(lsm6(lsm6_regs(true, 0), [0x10, 0x44]).accel_set_range(AccelRange16g))
+    test.assert(lsm6(lsm6_regs(true, 0), [0x10, 0x40]).accel_set_range(AccelRange2g))
+    test.assert(lsm6(lsm6_regs(true, 0), [0x10, 0x4c]).accel_set_range(AccelRange8g))
+    test.assert(lsm6(lsm6_regs(true, 0), [0x10, 0x48]).accel_set_range(AccelRange4g))
+
+@test
+fn test_each_accelerometer_range_has_its_sensitivity() [io, hw]
+    var r = lsm6_regs(true, 0)
+    // z = 8197 counts: 500 mg at 61 micro-g, 2000 at 244, 4000 at 488.
+    r[0x10] = 0x40
+    match lsm6(r, []).accel_read()
+        Some(a) => test.assert(a.z == 500)
+        None    => test.assert(false)
+    r[0x10] = 0x4c
+    match lsm6(r, []).accel_read()
+        Some(a) => test.assert(a.z == 2000)
+        None    => test.assert(false)
+    r[0x10] = 0x44
+    test.assert(lsm6(r, []).accel_range() == AccelRange16g)
+    match lsm6(r, []).accel_read()
+        Some(a) => test.assert(a.z == 4000)
+        None    => test.assert(false)
+
+@satisfies(REQ-DEV-009)
+@test
+fn test_set_rate_takes_the_slowest_rate_at_or_above_the_request() [io, hw]
+    // 100 Hz is set as 104 Hz (code 4) and keeps ±4 g: 0x48.
+    test.assert(lsm6(lsm6_regs(true, 0), [0x10, 0x48]).accel_set_rate_hz(100) == 104)
+    test.assert(lsm6(lsm6_regs(true, 0), [0x10, 0x18]).accel_set_rate_hz(1) == 12)
+    // Beyond the fastest rate the part takes its fastest, 6666 Hz.
+    test.assert(lsm6(lsm6_regs(true, 0), [0x10, 0xa8]).accel_set_rate_hz(10000) == 6666)
+    // A refused write leaves the rate as it was.
+    test.assert(lsm6(lsm6_regs(true, 0), []).accel_set_rate_hz(400) == 104)
+
+@test
+fn test_the_rates_of_each_code() [io]
+    let expected = [0, 12, 26, 52, 104, 208, 416, 833, 1666, 3333, 6666, 0]
+    for c in 0..12
+        test.assert(odr_of_code(c) == expected[c])
+
+@test
+fn test_the_fifo_is_drained_into_the_caller_s_buffer() [io, hw]
+    var dst: Vec[AccelMilliG; 32] = Vec.new()
+    let p = lsm6(lsm6_regs(true, 3), [])
+    test.assert(p.accel_fifo_count() == 3)
+    test.assert(p.accel_fifo_read(dst) == 3)
+    test.assert(dst.len() == 3)
+    test.assert(dst[2].z == 1000)
+    // A FIFO of 300 words moves only what the buffer holds.
+    let full = lsm6(lsm6_regs(true, 300), [])
+    test.assert(full.accel_fifo_count() == 300)
+    test.assert(full.accel_fifo_read(dst) == 32)
+    // A word tagged for another sensor is skipped.
+    var other = lsm6_regs(true, 2)
+    other[0x78] = 0x01 << 3
+    test.assert(lsm6(other, []).accel_fifo_read(dst) == 0)
+
+@satisfies(REQ-DEV-001)
+@test
+fn test_an_absent_part_answers_nothing() [io, hw]
+    var dst: Vec[AccelMilliG; 32] = Vec.new()
+    let p = gone6()
+    test.assert(p.gyro_read() == None)
+    test.assert(p.accel_read() == None)
+    test.assert(p.imu_read() == None)
+    test.assert(not p.gyro_ready())
+    test.assert(p.accel_fifo_count() == 0)
+    test.assert(p.accel_fifo_read(dst) == 0)
+    test.assert(p.device_id() == None)
+
+@satisfies(REQ-DEV-014)
+@test
+fn test_the_paired_sample_is_one_read() [io, hw]
+    match lsm6(lsm6_regs(true, 0), []).imu_read()
+        Some(s) =>
+            test.assert(s.accel.z == 1000)
+            test.assert(s.gyro.x == 8750)
+            test.assert(s.gyro.y == -8750)
+        None    => test.assert(false)
+
+@satisfies(REQ-DEV-008)
+@test
+fn test_the_async_forms_answer_the_next_sample() [io, hw, async]
+    match await lsm6(lsm6_regs(true, 0), []).gyro_next()
+        Some(g) => test.assert(g.x == 8750)
+        None    => test.assert(false)
+    match await lsm6(lsm6_regs(true, 0), []).accel_next()
+        Some(a) => test.assert(a.z == 1000)
+        None    => test.assert(false)
+    test.assert(await lsm6(lsm6_regs(false, 0), []).gyro_next() == None)
+
+@test
+fn test_a_fifo_read_that_fails_part_way_ends() [io, hw]
+    var dst: Vec[AccelMilliG; 32] = Vec.new()
+    // A part that counts two words and does not answer at
+    // FIFO_DATA_OUT_TAG moves nothing.
+    var r: [Int] = []
+    let all = lsm6_regs(true, 2)
+    for i in 0..0x78
+        list.push(r, all[i])
+    let p = lsm6(r, [])
+    test.assert(p.accel_fifo_count() == 2)
+    test.assert(p.accel_fifo_read(dst) == 0)
+
+// ── A magnetometer over I2C ──────────────────────────────────────────
+//
+// A part laid out as ST's LIS3MDL is.  WHO_AM_I (0x0F) reads 0x3D.  The
+// output data rate is bits 4 to 2 of CTRL_REG1 (0x20), from 0.625 Hz to
+// 80 Hz.  The full scale is bits 6 and 5 of CTRL_REG2 (0x21): ±4, ±8,
+// ±12 or ±16 gauss, at 6842, 3421, 2281 or 1711 steps per gauss.  Bit 3
+// of STATUS_REG (0x27) is set when all three axes have a new sample, and
+// the axes are six bytes from OUT_X_L (0x28), each little-endian.
+
+struct Lis3mdl
+    bus: FakeI2c
+    w: DeviceWiring
+
+// The sensitivity of a CTRL_REG2 full-scale code, in picotesla per
+// step: 10^8 pT per gauss over the steps per gauss.
+fn mag_pt_per_lsb(code: Int) -> Int
+    match code
+        0 => 14616
+        1 => 29231
+        2 => 43840
+        _ => 58445
+
+fn mag_rate_of(code: Int) -> Int
+    match code
+        0 => 0
+        1 => 1
+        2 => 2
+        3 => 5
+        4 => 10
+        5 => 20
+        6 => 40
+        _ => 80
+
+impl Identifiable[hw] for Lis3mdl
+    fn device_id(self) -> ?DeviceId [hw]
+        dev_id.id_read_i2c(self.bus, self.w, 0x0f)
+
+impl Magnetometer[hw] for Lis3mdl
+    fn mag_read(self) -> ?MagNanoT [hw]
+        let scale = match dev_bus.wiring_read(self.bus, self.w, 0x21, 1)
+            Some(c) => (c[0] as Int >> 5) & 3
+            None    => 0
+        let k = mag_pt_per_lsb(scale)
+        match dev_bus.wiring_read(self.bus, self.w, 0x28, 6)
+            Some(b) => Some(MagNanoT { x: dev_mag.mag_nano_t(le16(b, 0), 16, k),
+                                       y: dev_mag.mag_nano_t(le16(b, 2), 16, k),
+                                       z: dev_mag.mag_nano_t(le16(b, 4), 16, k) })
+            None    => None
+
+    fn mag_ready(self) -> Bool [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x27, 1)
+            Some(b) => (b[0] as Int & 0x08) != 0
+            None    => false
+
+    fn mag_rate_hz(self) -> Int [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x20, 1)
+            Some(b) => mag_rate_of((b[0] as Int >> 2) & 7)
+            None    => 0
+
+impl MagnetometerAsync[hw] for Lis3mdl
+    async fn mag_next(self) -> ?MagNanoT [hw]
+        self.mag_read_new()
+
+// The part at 10 Hz and ±4 gauss in the Earth's field: 20 µT on x and
+// -40 µT on z, a new sample waiting when `ready` is set.
+fn lis3mdl_regs(ready: Bool) -> [Int]
+    var r = list.zeros(48)
+    r[0x0f] = 0x3d
+    r[0x20] = 0x10
+    r[0x27] = if ready
+        0x08
+    else
+        0x00
+    // 20 µT is 0.2 gauss: 1368 counts (0x0558); -40 µT is -2737 (0xf54f).
+    r[0x28] = 0x58
+    r[0x29] = 0x05
+    r[0x2c] = 0x4f
+    r[0x2d] = 0xf5
+    r
+
+fn lis3mdl(regs: [Int]) -> Lis3mdl
+    Lis3mdl { bus: FakeI2c { addr: 0x1c, regs: regs, expect: [] }, w: dev_bus.wiring_i2c(0, 0x1c) }
+
+@test
+fn test_a_magnetometer_reads_the_field_in_nanotesla() [io, hw]
+    let m = lis3mdl(lis3mdl_regs(true))
+    test.assert(m.device_probe(0x3d))
+    match m.mag_read()
+        Some(f) =>
+            test.assert(f.x == 19994)
+            test.assert(f.y == 0)
+            test.assert(f.z == -40003)
+        None    => test.assert(false)
+    test.assert(m.mag_rate_hz() == 10)
+
+@test
+fn test_each_magnetometer_range_has_its_sensitivity() [io, hw]
+    var r = lis3mdl_regs(true)
+    let expected = [19994, 39988, 59973, 79952]
+    for code in 0..4
+        r[0x21] = code << 5
+        match lis3mdl(r).mag_read()
+            Some(f) => test.assert(f.x == expected[code])
+            None    => test.assert(false)
+
+@test
+fn test_the_magnetometer_rates() [io, hw]
+    let expected = [0, 1, 2, 5, 10, 20, 40, 80]
+    var r = lis3mdl_regs(true)
+    for code in 0..8
+        r[0x20] = code << 2
+        test.assert(lis3mdl(r).mag_rate_hz() == expected[code])
+
+@satisfies("REQ-DEV-002", "REQ-DEV-008")
+@test
+fn test_magnetometer_read_new_and_its_async_form() [io, hw, async]
+    test.assert(lis3mdl(lis3mdl_regs(false)).mag_read_new() == None)
+    match await lis3mdl(lis3mdl_regs(true)).mag_next()
+        Some(f) => test.assert(f.z == -40003)
+        None    => test.assert(false)
+
+@satisfies(REQ-DEV-001)
+@test
+fn test_an_absent_magnetometer_answers_nothing() [io, hw]
+    let m = Lis3mdl { bus: FakeI2c { addr: 0x1e, regs: lis3mdl_regs(true), expect: [] },
+                      w: dev_bus.wiring_i2c(0, 0x1c) }
+    test.assert(m.mag_read() == None)
+    test.assert(not m.mag_ready())
+    test.assert(m.mag_rate_hz() == 0)
+
+// ── A nine-axis pair ─────────────────────────────────────────────────
+
+// The six-axis part and the magnetometer on one bus, read as one IMU.
+struct Nine
+    six: Lsm6
+    mag: Lis3mdl
+
+impl Imu9[hw] for Nine
+    fn imu9_read(self) -> ?ImuSample9 [hw]
+        match self.six.imu_read()
+            Some(s) =>
+                match self.mag.mag_read()
+                    Some(m) => Some(ImuSample9 { accel: s.accel, gyro: s.gyro, mag: m })
+                    None    => None
+            None    => None
+
+@satisfies(REQ-DEV-014)
+@test
+fn test_a_nine_axis_sample_carries_all_three_kinds() [io, hw]
+    let n = Nine { six: lsm6(lsm6_regs(true, 0), []), mag: lis3mdl(lis3mdl_regs(true)) }
+    match n.imu9_read()
+        Some(s) =>
+            test.assert(s.accel.z == 1000)
+            test.assert(s.gyro.x == 8750)
+            test.assert(s.mag.z == -40003)
+            test.assert(dev_imu.imu_six_of_nine(s).gyro.y == -8750)
+        None    => test.assert(false)
+    let no_mag = Nine { six: lsm6(lsm6_regs(true, 0), []),
+                        mag: Lis3mdl { bus: FakeI2c { addr: 0x1e, regs: [], expect: [] },
+                                       w: dev_bus.wiring_i2c(0, 0x1c) } }
+    test.assert(no_mag.imu9_read() == None)
+    test.assert(Nine { six: gone6(), mag: lis3mdl(lis3mdl_regs(true)) }.imu9_read() == None)
+
+// ── A recorded IMU ───────────────────────────────────────────────────
+
+// One recorded sample of a board turning about z at 90 dps, performing
+// nothing.  It implements the two kinds and the bundle, and leaves the
+// rate setter and the FIFO to the traits' bodies.
+struct Recorded
+    dps: Int
+
+impl Accelerometer[] for Recorded
+    fn accel_read(self) -> ?AccelMilliG
+        Some(AccelMilliG { x: 0, y: 0, z: 1000 })
+
+    fn accel_ready(self) -> Bool
+        true
+
+    fn accel_range(self) -> AccelRange
+        AccelRange2g
+
+    fn accel_set_range(self, r: AccelRange) -> Bool
+        false
+
+    fn accel_rate_hz(self) -> Int
+        50
+
+impl Gyroscope[] for Recorded
+    fn gyro_read(self) -> ?GyroMilliDps
+        Some(GyroMilliDps { x: 0, y: 0, z: self.dps * 1000 })
+
+    fn gyro_ready(self) -> Bool
+        true
+
+    fn gyro_range(self) -> GyroRange
+        GyroRange250dps
+
+    fn gyro_set_range(self, r: GyroRange) -> Bool
+        r == GyroRange250dps
+
+    fn gyro_rate_hz(self) -> Int
+        50
+
+impl Imu[] for Recorded
+    fn imu_read(self) -> ?ImuSample
+        Some(ImuSample { accel: AccelMilliG { x: 0, y: 0, z: 1000 },
+                         gyro: GyroMilliDps { x: 0, y: 0, z: self.dps * 1000 } })
+
+// Whether the board lies flat and turns about its vertical axis, from
+// one paired sample, after setting the gyroscope's range: a caller that
+// takes the bundle and the two kinds.
+fn spinning_flat<D: Imu[e] + Accelerometer[ea] + Gyroscope[eg]>(d: D) -> Bool [e, ea, eg]
+    if not d.gyro_set_range(GyroRange250dps)
+        return false
+    match d.imu_read()
+        Some(s) => s.accel.z > 800 and s.gyro.z != 0
+        None    => false
+
+@satisfies(REQ-DEV-009)
+@test
+fn test_a_recorded_imu_needs_no_hardware()
+    var dst: Vec[AccelMilliG; 32] = Vec.new()
+    let r = Recorded { dps: 90 }
+    test.assert(spinning_flat(r))
+    test.assert(not spinning_flat(Recorded { dps: 0 }))
+    // A part with a fixed rate and no FIFO.
+    test.assert(r.accel_set_rate_hz(400) == 50)
+    test.assert(r.accel_fifo_count() == 0)
+    let _ = dst.push(AccelMilliG { x: 1, y: 1, z: 1 })
+    test.assert(r.accel_fifo_read(dst) == 0)
+    test.assert(dst.is_empty())
+    test.assert(r.gyro_read_new() != None)
+    test.assert(r.gyro_rate_hz() == 50)
+
+// ── The ranges and the conversions ───────────────────────────────────
+
+@test
+fn test_full_scale_of_each_gyroscope_range() [io]
+    test.assert(dev_gyro.gyro_full_scale(GyroRange250dps) == 250)
+    test.assert(dev_gyro.gyro_full_scale(GyroRange500dps) == 500)
+    test.assert(dev_gyro.gyro_full_scale(GyroRange1000dps) == 1000)
+    test.assert(dev_gyro.gyro_full_scale(GyroRange2000dps) == 2000)
+
+@test
+fn test_the_narrowest_gyroscope_range_that_reaches_a_peak() [io]
+    test.assert(dev_gyro.gyro_range_for(0) == Some(GyroRange250dps))
+    test.assert(dev_gyro.gyro_range_for(-250000) == Some(GyroRange250dps))
+    test.assert(dev_gyro.gyro_range_for(250001) == Some(GyroRange500dps))
+    test.assert(dev_gyro.gyro_range_for(-900000) == Some(GyroRange1000dps))
+    test.assert(dev_gyro.gyro_range_for(2000000) == Some(GyroRange2000dps))
+    test.assert(dev_gyro.gyro_range_for(2000001) == None)
+
+@test
+fn test_a_gyroscope_count_is_scaled_by_its_sensitivity() [io]
+    test.assert(dev_gyro.gyro_milli_dps(1000, 16, 8750) == 8750)
+    test.assert(dev_gyro.gyro_milli_dps(0xfc18, 16, 8750) == -8750)
+    // 131 steps per dps is 7633 micro-dps per step: 131 steps are 999.
+    test.assert(dev_gyro.gyro_milli_dps(131, 16, 7633) == 999)
+    test.assert(dev_gyro.gyro_milli_dps(0x8000, 16, 70000) == -2293760)
+
+@test
+fn test_a_magnetometer_count_is_scaled_to_nanotesla() [io]
+    test.assert(dev_mag.mag_nano_t(6842, 16, 14616) == 100002)
+    test.assert(dev_mag.mag_nano_t(0xffff, 16, 150000) == -150)
+    // A 13-bit part at 0.3 µT per step.
+    test.assert(dev_mag.mag_nano_t(0x1000, 13, 300000) == -1228800)

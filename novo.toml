@@ -1,12 +1,12 @@
 [package]
 name        = "devices-nv"
-version     = "0.1.1"
-description = "The traits a program reads a board's peripheral chips through: an accelerometer, a thermometer, a power manager and a real-time clock, each as a sync trait and an async one, with readings in milli-g, milli-degrees, millivolts and milliamps, and calendar time as types.  Drivers implement them over embedded-hal-nv's I2C and SPI buses and the pins a board gives; block storage is embedded-hal-nv's own trait."
+version     = "0.2.0"
+description = "The traits a program reads a board's peripheral chips through: an accelerometer, a gyroscope, a magnetometer and the IMU bundles, a thermometer, a hygrometer, a barometer, a power manager and a real-time clock, each as a sync trait and an async one, with readings in integer units as types, and a part's identification byte.  Drivers implement them over embedded-hal-nv's I2C and SPI buses and the pins a board gives; block storage is embedded-hal-nv's own trait."
 license     = "Apache-2.0"
 stability   = "experimental"
 category    = "embedded"
 layer       = "host"
-tags        = ["embedded", "drivers", "accelerometer", "thermometer", "pmic", "rtc", "i2c", "spi", "sensor", "traits"]
+tags        = ["embedded", "drivers", "accelerometer", "gyroscope", "magnetometer", "imu", "thermometer", "humidity", "pressure", "pmic", "rtc", "i2c", "spi", "sensor", "traits"]
 repository  = "https://github.com/novolang/devices-nv"
 maintainers = ["novo-lang"]
 # 0.19.0 is the first release that admits `==` on a payload-free

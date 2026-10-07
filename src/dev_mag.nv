@@ -1,0 +1,64 @@
+// dev_mag — a magnetometer: a device that measures the magnetic field
+// along three axes.
+//
+// The Earth's field at the surface is between about 25 and 65
+// microtesla, and a magnetometer that reads it tells a program which
+// way the board faces, as a compass does.  Iron and current-carrying
+// wires near the part add their own field, so a program that needs a
+// heading calibrates the part where it is mounted.
+//
+// A reading here is in nanotesla (nT), a thousandth of a microtesla.
+// Data sheets state a part's sensitivity in gauss or in microtesla per
+// step; one gauss is 100 microtesla, or 100 000 nT.  An integer in
+// nanotesla resolves every part in use without a fraction.
+
+use dev_bus.{ dev_sign_extend }
+
+// One sample: the field along each axis, in nanotesla.
+pub @value
+struct MagNanoT
+    x: Int
+    y: Int
+    z: Int
+
+// What a program reads from a magnetometer.
+//
+// `mag_read` answers the most recent sample, or `None` when the device
+// did not answer.  `mag_ready` answers whether a sample has completed
+// since the last read, from the part's data-ready flag.  `mag_rate_hz`
+// answers the sample rate in samples per second.
+pub trait Magnetometer[e]
+    fn mag_read(self) -> ?MagNanoT [e]
+    fn mag_ready(self) -> Bool [e]
+    fn mag_rate_hz(self) -> Int [e]
+
+    // A new sample, or `None` when none has completed since the last
+    // read or the device did not answer.
+    fn mag_read_new(self) -> ?MagNanoT [e]
+        if not self.mag_ready()
+            return None
+        self.mag_read()
+
+// A magnetometer on a host's scheduler: `mag_next` parks the task until
+// the part's next sample is complete and answers it.  At
+// `@tier(embedded)` a device implements `dev_bus.AsyncDeviceReady`
+// instead.
+pub trait MagnetometerAsync[e]
+    async fn mag_next(self) -> ?MagNanoT [e]
+
+// The field in nanotesla that a raw count means.
+//
+// `raw` is the axis's count right-justified, and `bits` is how many bits
+// it has; the count is two's complement.  `pico_t_per_lsb` is the
+// part's sensitivity in picotesla for each step, a thousandth of a
+// nanotesla: a part that gives 6842 steps per gauss at ±4 gauss steps
+// 100 000 000 / 6842, about 14 616 pT, and one that gives 0.15 µT per
+// step steps 150 000 pT.  The answer is rounded toward zero.
+//
+// ```novo
+// fn main() [io]
+//     // 6842 steps at 6842 steps per gauss is 1 gauss.
+//     println("${dev_mag.mag_nano_t(6842, 16, 14616)}")   // 100002
+// ```
+pub fn mag_nano_t(raw: Int, bits: Int, pico_t_per_lsb: Int) -> Int
+    dev_sign_extend(raw, bits) * pico_t_per_lsb / 1000

@@ -97,8 +97,11 @@ impl GpioOut for FakePins
 // bit 3 of STATUS (0x27); the axes are six bytes from OUT_X_L (0x28),
 // each little-endian and left-justified to 12 bits; the full scale is
 // bits 5 and 4 of CTRL_REG4 (0x23); and the output data rate is the top
-// four bits of CTRL_REG1 (0x20).  The part here auto-increments its
-// register pointer on a multi-byte read.
+// four bits of CTRL_REG1 (0x20).  FIFO_SRC_REG (0x2F) describes the
+// part's 32-sample FIFO: bit 5 is set when it is empty, bit 6 when it is
+// full, and bits 4 to 0 count the unread samples otherwise; a FIFO read
+// is a read of the axes, each answering the oldest sample.  The part
+// here auto-increments its register pointer on a multi-byte read.
 
 struct I2cAccel
     bus: FakeI2c
@@ -157,6 +160,41 @@ impl Accelerometer[hw] for I2cAccel
             Some(b) => rate_of_code(b[0] as Int >> 4)
             None    => 0
 
+    // The slowest of the codes 1 to 5 at or above `hz`, keeping the
+    // axis-enable bits.
+    fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
+        var code = 5
+        for k in 1..6
+            if rate_of_code(k) >= hz and code == 5
+                code = k
+        let low = match dev_bus.wiring_read(self.bus, self.w, 0x20, 1)
+            Some(b) => b[0] as Int & 0x0f
+            None    => 0x07
+        if dev_bus.wiring_write(self.bus, self.w, 0x20, [((code << 4) | low) as u8])
+            return rate_of_code(code)
+        self.accel_rate_hz()
+
+    fn accel_fifo_count(self) -> Int [hw]
+        match dev_bus.wiring_read(self.bus, self.w, 0x2f, 1)
+            Some(b) =>
+                let src = b[0] as Int
+                if (src & 0x20) != 0
+                    return 0
+                if (src & 0x40) != 0
+                    return 32
+                src & 0x1f
+            None    => 0
+
+    fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
+        dst.clear()
+        for i in 0..self.accel_fifo_count()
+            match self.accel_read()
+                Some(a) =>
+                    let _ = dst.push(a)
+                None    =>
+                    break
+        dst.len()
+
 impl AccelerometerAsync[hw] for I2cAccel
     async fn accel_next(self) -> ?AccelMilliG [hw]
         self.accel_read_new()
@@ -210,6 +248,7 @@ fn test_the_range_scales_the_reading() [io, hw]
         Some(a) => test.assert(a.z == 4000)
         None    => test.assert(false)
 
+@satisfies(REQ-DEV-001)
 @test
 fn test_an_absent_part_answers_nothing() [io, hw]
     let p = I2cAccel { bus: FakeI2c { addr: 0x19, regs: at_rest(true), expect: [] },
@@ -228,6 +267,39 @@ fn test_set_range_writes_the_full_scale_bits() [io, hw]
 fn test_the_rate_is_read_from_the_part() [io, hw]
     test.assert(part(at_rest(true), []).accel_rate_hz() == 100)
 
+@satisfies(REQ-DEV-009)
+@test
+fn test_set_rate_writes_the_slowest_rate_at_or_above_the_request() [io, hw]
+    // 100 Hz (0x57) to 30 Hz: 50 Hz, code 4, with the axes on: 0x47.
+    test.assert(part(at_rest(true), [0x20, 0x47]).accel_set_rate_hz(30) == 50)
+    test.assert(part(at_rest(true), [0x20, 0x17]).accel_set_rate_hz(0) == 1)
+    test.assert(part(at_rest(true), [0x20, 0x57]).accel_set_rate_hz(1000) == 100)
+    // A refused write leaves the rate as it was.
+    test.assert(part(at_rest(true), []).accel_set_rate_hz(10) == 100)
+    // An absent part answers no rate.
+    let gone = I2cAccel { bus: FakeI2c { addr: 0x19, regs: at_rest(true), expect: [0x20, 0x27] },
+                          w: dev_bus.wiring_i2c(0, 0x18) }
+    test.assert(gone.accel_set_rate_hz(10) == 0)
+
+@test
+fn test_the_fifo_counts_and_moves_its_samples() [io, hw]
+    var dst: Vec[AccelMilliG; 32] = Vec.new()
+    var regs = at_rest(true)
+    regs[0x2f] = 0x05
+    let p = part(regs, [])
+    test.assert(p.accel_fifo_count() == 5)
+    test.assert(p.accel_fifo_read(dst) == 5)
+    test.assert(dst[4].z == 1000)
+    regs[0x2f] = 0x20 | 0x05
+    test.assert(part(regs, []).accel_fifo_count() == 0)
+    regs[0x2f] = 0x40 | 0x1f
+    test.assert(part(regs, []).accel_fifo_count() == 32)
+    test.assert(part(regs, []).accel_fifo_read(dst) == 32)
+    let gone = I2cAccel { bus: FakeI2c { addr: 0x19, regs: regs, expect: [] }, w: dev_bus.wiring_i2c(0, 0x18) }
+    test.assert(gone.accel_fifo_count() == 0)
+    test.assert(gone.accel_fifo_read(dst) == 0)
+
+@satisfies(REQ-DEV-002)
 @test
 fn test_read_new_answers_only_a_new_sample() [io, hw]
     test.assert(part(at_rest(false), []).accel_read_new() == None)
@@ -235,6 +307,7 @@ fn test_read_new_answers_only_a_new_sample() [io, hw]
         Some(a) => test.assert(a.z == 1000)
         None    => test.assert(false)
 
+@satisfies(REQ-DEV-008)
 @test
 fn test_the_async_form_answers_the_next_sample() [io, hw, async]
     match await part(at_rest(true), []).accel_next()
@@ -288,6 +361,7 @@ fn test_a_part_on_spi_reads_its_axes_in_one_window() [io, hw]
     test.assert(not p.accel_set_range(AccelRange4g))
     test.assert(p.accel_rate_hz() == 100)
 
+@satisfies(REQ-DEV-001)
 @test
 fn test_a_part_wired_without_a_chip_select_answers_nothing() [io, hw]
     let p = SpiAccel { bus: FakeSpi { rx: [0, 0, 0, 0, 0, 0], trip: -1 },

@@ -1,0 +1,68 @@
+// dev_imu — an inertial measurement unit (IMU): an accelerometer and a
+// gyroscope in one part, and sometimes a magnetometer too.
+//
+// An IMU's driver implements each kind's trait, `Accelerometer` and
+// `Gyroscope`, and `Magnetometer` for a nine-axis part, and a program
+// configures each kind through them.  What one part adds is a sample of
+// all its kinds taken together: the part latches them at one instant
+// and the driver reads them in one bus transaction, so the readings
+// describe the same moment.  Two separate reads, one per kind, may
+// straddle a new sample.  `Imu` and `Imu9` answer that paired sample.
+//
+// A function that needs both the paired sample and the kinds'
+// configuration takes the bounds it needs, each binding an effect
+// parameter of its own, and declares their union:
+//
+//     fn level<D: Imu[e] + Accelerometer[ea] + Gyroscope[eg]>(d: D) -> Bool [e, ea, eg]
+//
+// `Imu` does not require the kinds as supertraits, because a supertrait
+// cannot carry an effect argument.  A driver implements them all the
+// same.
+
+use dev_accel.{ AccelMilliG }
+use dev_gyro.{ GyroMilliDps }
+use dev_mag.{ MagNanoT }
+
+// A sample of an accelerometer and a gyroscope taken at one instant.
+pub @value
+struct ImuSample
+    accel: AccelMilliG
+    gyro: GyroMilliDps
+
+// A sample of an accelerometer, a gyroscope and a magnetometer taken at
+// one instant.
+pub @value
+struct ImuSample9
+    accel: AccelMilliG
+    gyro: GyroMilliDps
+    mag: MagNanoT
+
+// A six-axis IMU: `imu_read` answers the most recent paired sample, read
+// in one transaction, or `None` when the device did not answer.
+pub trait Imu[e]
+    fn imu_read(self) -> ?ImuSample [e]
+
+// A nine-axis IMU: `imu9_read` answers the most recent sample of all
+// three kinds, or `None` when the device did not answer.  A part whose
+// magnetometer is a second chip behind the first reads it through the
+// first, and the sample is then as close to one instant as the part
+// allows.
+pub trait Imu9[e]
+    fn imu9_read(self) -> ?ImuSample9 [e]
+
+// The paired sample of a six-axis read, from a nine-axis one.
+//
+// ```novo
+// use dev_imu.{ ImuSample9 }
+// use dev_accel.{ AccelMilliG }
+// use dev_gyro.{ GyroMilliDps }
+// use dev_mag.{ MagNanoT }
+//
+// fn main() [io]
+//     let s = ImuSample9 { accel: AccelMilliG { x: 0, y: 0, z: 1000 },
+//                          gyro: GyroMilliDps { x: 0, y: 0, z: 0 },
+//                          mag: MagNanoT { x: 20000, y: 0, z: -40000 } }
+//     println("${dev_imu.imu_six_of_nine(s).accel.z}")   // 1000
+// ```
+pub fn imu_six_of_nine(s: ImuSample9) -> ImuSample
+    ImuSample { accel: s.accel, gyro: s.gyro }
