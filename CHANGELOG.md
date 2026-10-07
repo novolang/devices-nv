@@ -5,6 +5,35 @@ All notable changes to devices-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.3.0 — 2026-10-08
+
+A device's enable pin in its wiring.
+
+### Breaking changes and migrations
+
+- **`DeviceWiring` gains `en: ?Int`**, the pin that powers or enables
+  the device, `None` when the board powers it unconditionally.  A board's
+  `devices` block names it with `en <pin>`, and the build writes it into
+  the wiring it hands the driver's `attach`; the driver drives the pin,
+  since the level and the wait are the part's.  `wiring_i2c` and
+  `wiring_spi` answer `en: None`, and `wiring_irq` keeps the pin it is
+  given.  *Migration:* a record literal adds `en: None`, or `en: Some(pin)`
+  for a device with an enable pin.
+
+### Added
+
+- `wiring_en(w, pin)`, the same wiring with the enable pin on `pin`, and
+  `wiring_has_en(w)`.
+
+### Changed
+
+- The dependency on embedded-hal-nv is `>= 0.2.0, < 0.4.0`: the bus,
+  GPIO and block traits this package uses are the same in 0.3.0, which
+  added CAN, so a board on either release builds with this one.
+- The toolchain floor is 0.19.3: a build that resolves embedded-hal-nv
+  afresh takes 0.3.0, which needs `hal.can`.  The package's own sources
+  still build from 0.19.1.
+
 ## 0.2.0 — 2026-10-07
 
 New kinds of device, the IMU bundles, a part's identification, and

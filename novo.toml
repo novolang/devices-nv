@@ -1,6 +1,6 @@
 [package]
 name        = "devices-nv"
-version     = "0.2.0"
+version     = "0.3.0"
 description = "The traits a program reads a board's peripheral chips through: an accelerometer, a gyroscope, a magnetometer and the IMU bundles, a thermometer, a hygrometer, a barometer, a power manager and a real-time clock, each as a sync trait and an async one, with readings in integer units as types, and a part's identification byte.  Drivers implement them over embedded-hal-nv's I2C and SPI buses and the pins a board gives; block storage is embedded-hal-nv's own trait."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -9,12 +9,11 @@ layer       = "host"
 tags        = ["embedded", "drivers", "accelerometer", "gyroscope", "magnetometer", "imu", "thermometer", "humidity", "pressure", "pmic", "rtc", "i2c", "spi", "sensor", "traits"]
 repository  = "https://github.com/novolang/devices-nv"
 maintainers = ["novo-lang"]
-# 0.19.1 is the first release whose @value structs hold an optional
-# field (SPEC § 14.2), which `DeviceWiring`, `BatteryReading` and
-# `DeviceId` do, and the first that returns a function's `?V` from a
-# trait method answering a boxed optional, which the imu and env test
-# drivers do.
-novo        = ">= 0.19.1"
+# 0.19.3 is the first release with hal.can, which embedded-hal-nv 0.3.0
+# calls; a build that resolves the dependency afresh takes 0.3.0.  This
+# package's own sources build from 0.19.1, the first release whose
+# @value structs hold an optional field (SPEC § 14.2).
+novo        = ">= 0.19.3"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -24,5 +23,6 @@ novo        = ">= 0.19.1"
 
 [dependencies]
 # The bus traits a driver is written over, the GPIO trait a chip-select
-# pin is driven through, and the block-storage trait.
-embedded-hal-nv = "^0.2.0"
+# pin is driven through, and the block-storage trait.  They are the same
+# in 0.2.x and 0.3.x, which added CAN, so a board on either builds.
+embedded-hal-nv = ">= 0.2.0, < 0.4.0"

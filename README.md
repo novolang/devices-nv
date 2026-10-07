@@ -20,10 +20,13 @@ answers at a seven-bit address. On an **SPI** bus a device is selected
 by a **chip-select** pin, which the controller drives low for the
 length of a transaction. A device may also drive an **interrupt line**,
 a pin it pulses or holds when it has something to report, such as a new
-sample or an alarm. `DeviceWiring` records the bus, and as optionals
-the address or the chip-select pin and the interrupt pin: a device on
-I2C has `addr` and `cs` is `None`, one on SPI the reverse, and `irq` is
-`None` when the board wires no interrupt line. The record is a value
+sample or an alarm, and it may have a pin that powers or enables it.
+`DeviceWiring` records the bus, and as optionals the address or the
+chip-select pin, the interrupt pin and the enable pin: a device on I2C
+has `addr` and `cs` is `None`, one on SPI the reverse, `irq` is `None`
+when the board wires no interrupt line, and `en` is `None` when the
+board powers the device unconditionally. The driver drives `en`, since
+the level and the wait are the part's. The record is a value
 with no allocation, so a driver at the embedded tier holds it.
 
 A **trait** is a named set of method signatures, and a **driver** is a

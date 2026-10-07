@@ -121,6 +121,26 @@ fn test_an_interrupt_line_keeps_the_rest_of_the_wiring() [io]
     test.assert(w.bus == 2)
     test.assert(w.addr == Some(0x6b))
     test.assert(w.cs == None)
+    test.assert(w.en == None)
+
+@test
+fn test_a_wiring_has_no_enable_pin_until_one_is_given() [io]
+    let w = dev_bus.wiring_spi(0, 25)
+    test.assert(w.en == None)
+    test.assert(not dev_bus.wiring_has_en(w))
+    let p = dev_bus.wiring_en(w, 23)
+    test.assert(dev_bus.wiring_has_en(p))
+    test.assert(p.en == Some(23))
+    test.assert(p.cs == Some(25))
+    test.assert(p.bus == 0)
+
+@test
+fn test_an_interrupt_line_keeps_the_enable_pin() [io]
+    let w = dev_bus.wiring_irq(dev_bus.wiring_en(dev_bus.wiring_spi(0, 25), 23), 24)
+    test.assert(w.en == Some(23))
+    test.assert(w.irq == Some(24))
+    test.assert(w.cs == Some(25))
+    test.assert(w.addr == None)
 
 // ── Register access over I2C ─────────────────────────────────────────
 

@@ -7,9 +7,11 @@
 // chip-select pin that the controller drives low for the length of a
 // transaction.  Either way it may also drive an interrupt line, a GPIO
 // pin it pulses or holds when it has something to report: a new
-// sample, a finished conversion, an alarm.  `DeviceWiring` records the
-// three facts, each optional, `None` for the ones a device does not use,
-// and is what a driver is constructed from.
+// sample, a finished conversion, an alarm.  It may also have a pin that
+// powers or enables it, which the board drives before the device
+// answers.  `DeviceWiring` records these facts, each optional, `None`
+// for the ones a device does not use, and is what a driver is
+// constructed from.
 //
 // The functions over a bus take the bus as a type parameter bounded by
 // embedded-hal-nv's `I2cBus` or `SpiBus`, so a driver written over them
@@ -27,10 +29,13 @@ use embedded_hal.{ I2cBus, SpiBus, GpioOut }
 // below take that bus as their first argument.  `addr` is the
 // seven-bit I2C address, `None` on SPI.  `cs` is the chip-select pin on
 // SPI, `None` on I2C.  `irq` is the pin the device's interrupt line
-// reaches, `None` when it has none or the board does not wire it.  A pin
-// is the hardware's own number, as `embedded_hal.GpioOut` takes it.
+// reaches, `None` when it has none or the board does not wire it.  `en`
+// is the pin that powers or enables the device, `None` when the board
+// powers it unconditionally; the driver drives it, since only the
+// driver knows the level and the time the part needs.  A pin is the
+// hardware's own number, as `embedded_hal.GpioOut` takes it.
 //
-// The three optional fields are flat: each is a flag beside its value,
+// The four optional fields are flat: each is a flag beside its value,
 // inside the record, so a wiring is built, copied and read without an
 // allocation, at the embedded tier as anywhere else.
 pub @value
@@ -39,6 +44,7 @@ struct DeviceWiring
     addr: ?Int
     cs: ?Int
     irq: ?Int
+    en: ?Int
 
 // A device on I2C bus `bus` at the seven-bit address `addr`, with no
 // interrupt line.
@@ -48,12 +54,12 @@ struct DeviceWiring
 // println("${w.addr ?? -1}")        // 24
 // ```
 pub fn wiring_i2c(bus: Int, addr: Int) -> DeviceWiring
-    DeviceWiring { bus: bus, addr: Some(addr), cs: None, irq: None }
+    DeviceWiring { bus: bus, addr: Some(addr), cs: None, irq: None, en: None }
 
 // A device on SPI bus `bus` selected by the pin `cs`, with no interrupt
 // line.
 pub fn wiring_spi(bus: Int, cs: Int) -> DeviceWiring
-    DeviceWiring { bus: bus, addr: None, cs: Some(cs), irq: None }
+    DeviceWiring { bus: bus, addr: None, cs: Some(cs), irq: None, en: None }
 
 // The same wiring with the device's interrupt line on pin `irq`.
 //
@@ -62,7 +68,16 @@ pub fn wiring_spi(bus: Int, cs: Int) -> DeviceWiring
 // println("${dev_bus.wiring_has_irq(w)}")   // true
 // ```
 pub fn wiring_irq(w: DeviceWiring, irq: Int) -> DeviceWiring
-    DeviceWiring { bus: w.bus, addr: w.addr, cs: w.cs, irq: Some(irq) }
+    DeviceWiring { bus: w.bus, addr: w.addr, cs: w.cs, irq: Some(irq), en: w.en }
+
+// The same wiring with the device's enable pin on pin `en`.
+//
+// ```novo
+// let w = dev_bus.wiring_en(dev_bus.wiring_spi(0, 25), 23)
+// println("${w.en ?? -1}")          // 23
+// ```
+pub fn wiring_en(w: DeviceWiring, en: Int) -> DeviceWiring
+    DeviceWiring { bus: w.bus, addr: w.addr, cs: w.cs, irq: w.irq, en: Some(en) }
 
 // Whether the device is selected by a chip-select pin, which is to say
 // it sits on SPI.
@@ -72,6 +87,10 @@ pub fn wiring_is_spi(w: DeviceWiring) -> Bool
 // Whether the board wires the device's interrupt line to a pin.
 pub fn wiring_has_irq(w: DeviceWiring) -> Bool
     w.irq != None
+
+// Whether the board gives the device an enable pin.
+pub fn wiring_has_en(w: DeviceWiring) -> Bool
+    w.en != None
 
 // Reads `n` bytes from the register `reg` of an I2C device, in one
 // transaction: the register address is written, then a repeated start
